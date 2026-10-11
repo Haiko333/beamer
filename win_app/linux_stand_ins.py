@@ -1,18 +1,10 @@
 """The OS parts Linux has no back end for, on X11 and Wayland alike: the firewall check and the
 lock screen. Each answers as a machine that has nothing and does nothing, mirroring only the names
-the shell reaches through platform_parts, with the Windows module's signatures. The clipboard
-here is the same for a desktop whose clipboard Beamer cannot reach: nothing is copied, and nothing
-fails."""
+the shell reaches through platform_parts, with the Windows module's signatures."""
 
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
-
-clipboard = SimpleNamespace(
-    get_contents=lambda: (None, None),
-    set_contents=lambda text, png: False,
-    change_stamp=lambda: None,
-)
 
 unlock = SimpleNamespace(
     is_locked=lambda: None,

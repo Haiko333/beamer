@@ -59,12 +59,13 @@ def load(platform: str, environ=os.environ, portals=None) -> SimpleNamespace:
         if chosen == "evdev":
             import autostart_x11
             import capture_absent
+            import clipboard_wl
             import desktop_wlroots
             import inject_uinput
 
             return SimpleNamespace(**dict(
                 stand_ins, backend=chosen, capture=capture_absent, desktop=desktop_wlroots,
-                clipboard=linux_stand_ins.clipboard, autostart=autostart_x11, injector=inject_uinput,
+                clipboard=clipboard_wl, autostart=autostart_x11, injector=inject_uinput,
             ))
         if chosen == "portal":
             import autostart_x11
