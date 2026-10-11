@@ -97,7 +97,7 @@ def child(mode: str, config: Path) -> None:
         assert window.sender.input_held() is False
         assert window._identity()["platform"] == "linux"
         # What Wayland takes away, said where it applies, and no window drawn at an edge.
-        assert platform_parts.WAYLAND is True
+        assert platform_parts.WAYLAND is True and platform_parts.PORTAL is True
         assert "only brings input back" in window.wayland_shortcut_note.text()
         assert not window.wayland_shortcut_note.isHidden()
         assert window.hold_switch.isHidden() and window.pointer_module.isHidden()
@@ -197,7 +197,8 @@ class LinuxStartTest(unittest.TestCase):
                 "mac_host": "192.0.2.10", "mac_return_edge": "left",
                 "allow_mac_to_drive": True, "send_to_mac": True,
             }))
-            env = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_CONFIG_HOME=directory, XDG_SESSION_TYPE="wayland")
+            env = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_CONFIG_HOME=directory, XDG_SESSION_TYPE="wayland",
+                       BEAMER_BACKEND="portal")
             env.pop("LOCALAPPDATA", None)
             for mode in ("window", "main", "main-hidden"):
                 done = subprocess.run(

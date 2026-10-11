@@ -3,8 +3,11 @@ geometry, autostart, firewall and unlock, which also carry the touchpad injector
 (input_injector and desktop_win reach them). Chosen once, at import.
 
 Linux on X11 gets the X11 back ends for capture, injection, the clipboard, desktop geometry and
-autostart; Linux on Wayland gets the portal back ends (InputCapture, RemoteDesktop and its
-clipboard, over libei) and the same XDG autostart; both get linux_stand_ins for the firewall and
+autostart; Linux on Wayland gets one of two whole sets (`backend`): the portal back ends
+(InputCapture, RemoteDesktop and its clipboard, over libei) where the desktop has the RemoteDesktop
+portal, as GNOME and KDE do, else the evdev back ends, which need no portal and so serve Hyprland,
+sway and every other compositor. The sets are not mixed: desktop_portal's pointer is whatever its
+two neighbours last told it. All get the same XDG autostart and linux_stand_ins for the firewall and
 unlock, and no Windows module beyond the pure pieces capture_x11 and inject_x11 borrow. Every other platform keeps the Windows
 modules, including the Mac, where the win_app tests import them on purpose. The callers keep
 their old names (`capture_win` and so on) bound to these, so a test that patches
@@ -14,7 +17,10 @@ import os
 import sys
 from types import SimpleNamespace
 
+import linux_desktop
+
 PARTS = ("capture", "desktop", "clipboard", "autostart", "firewall", "unlock", "injector")
+WAYLAND_BACKENDS = ("portal", "evdev")
 
 
 def session(environ) -> str:
@@ -29,13 +35,37 @@ def session(environ) -> str:
     return "wayland"
 
 
-def load(platform: str, environ=os.environ) -> SimpleNamespace:
+def backend(environ, portals=None) -> str:
+    """Which set of Linux back ends: "x11", "portal" or "evdev". BEAMER_BACKEND names a Wayland set
+    outright (evdev on GNOME or KDE lets the shortcut send input away, which no portal allows);
+    otherwise the portal set is used wherever the desktop can be driven through it, and a desktop
+    with no RemoteDesktop portal, or no portal at all, gets evdev. `portals` answers what the desktop
+    has (linux_desktop.portals) and is asked only when nothing else decides."""
+    if session(environ) == "x11":
+        return "x11"
+    forced = environ.get("BEAMER_BACKEND", "").strip().lower()
+    if forced in WAYLAND_BACKENDS:
+        return forced
+    return "portal" if "RemoteDesktop" in (portals or linux_desktop.portals)() else "evdev"
+
+
+def load(platform: str, environ=os.environ, portals=None) -> SimpleNamespace:
     # Plain imports, not importlib: PyInstaller finds modules by reading import statements.
     if platform.startswith("linux"):
         import linux_stand_ins
 
         stand_ins = {"firewall": linux_stand_ins.firewall, "unlock": linux_stand_ins.unlock}
-        if session(environ) != "x11":
+        chosen = backend(environ, portals)
+        if chosen == "evdev":
+            import autostart_x11
+            import capture_absent
+            import desktop_portal
+
+            return SimpleNamespace(**dict(
+                stand_ins, backend=chosen, capture=capture_absent, desktop=desktop_portal,
+                clipboard=linux_stand_ins.clipboard, autostart=autostart_x11, injector=linux_stand_ins.injector,
+            ))
+        if chosen == "portal":
             import autostart_x11
             import capture_portal
             import clipboard_portal
@@ -43,7 +73,7 @@ def load(platform: str, environ=os.environ) -> SimpleNamespace:
             import inject_portal
 
             return SimpleNamespace(**dict(
-                stand_ins, capture=capture_portal, desktop=desktop_portal, clipboard=clipboard_portal,
+                stand_ins, backend=chosen, capture=capture_portal, desktop=desktop_portal, clipboard=clipboard_portal,
                 autostart=autostart_x11, injector=inject_portal,
             ))
         import autostart_x11
@@ -53,7 +83,7 @@ def load(platform: str, environ=os.environ) -> SimpleNamespace:
         import inject_x11
 
         return SimpleNamespace(**dict(
-            stand_ins, capture=capture_x11, desktop=desktop_x11, clipboard=clipboard_x11, autostart=autostart_x11,
+            stand_ins, backend=chosen, capture=capture_x11, desktop=desktop_x11, clipboard=clipboard_x11, autostart=autostart_x11,
             injector=inject_x11,
         ))
     import autostart_win
@@ -65,16 +95,20 @@ def load(platform: str, environ=os.environ) -> SimpleNamespace:
     import unlock_win
 
     return SimpleNamespace(
-        capture=capture_win, desktop=desktop_win, clipboard=clipboard_win, autostart=autostart_win,
+        backend="", capture=capture_win, desktop=desktop_win, clipboard=clipboard_win, autostart=autostart_win,
         firewall=firewall_win, unlock=unlock_win, injector=input_injector,
     )
 
 
 _parts = load(sys.platform)
 
-# Wayland lets no app draw at the screen's edges, see a full-screen app or a button held before
-# the pointer met a barrier, and lets input leave only across an edge: the app says so where it applies.
+# "x11", "portal" or "evdev" on Linux, "" elsewhere.
+BACKEND = _parts.backend
+# Wayland lets no app draw at the screen's edges: the app says so where it applies.
 WAYLAND = sys.platform.startswith("linux") and session(os.environ) != "x11"
+# The portals show no full-screen app and no button held before the pointer met a barrier, and let
+# input leave only across an edge. The evdev back ends are under none of that.
+PORTAL = BACKEND == "portal"
 
 capture = _parts.capture
 desktop = _parts.desktop

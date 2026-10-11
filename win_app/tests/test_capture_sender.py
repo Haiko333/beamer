@@ -63,7 +63,7 @@ def check_linux_key(capture, session, code, name, us):
 
 class CaptureSenderTests(unittest.TestCase):
     def check_backend(self, session):
-        capture = platform_parts.load("linux", {"XDG_SESSION_TYPE": session}).capture
+        capture = platform_parts.load("linux", {"XDG_SESSION_TYPE": session, "BEAMER_BACKEND": "portal"}).capture
         with mock.patch.object(kvm_bridge_win, "capture_win", capture), mock.patch.object(sender, "OWN_PLATFORM", "linux"):
             for code, name, us in ((30, "a", "a"), (28, "enter", None), (42, "shift", None)):
                 with self.subTest(key=name):

@@ -1122,8 +1122,8 @@ class WindowsApplication(QWidget):
             "edge, so the edges are never held for one and a drag can cross.", "note", wrap=True)
         module.body.addWidget(self.wayland_crossing_note)
         for widget in (self.hold_switch, own_note, hold_note):
-            widget.setVisible(not platform_parts.WAYLAND)
-        self.wayland_crossing_note.setVisible(platform_parts.WAYLAND)
+            widget.setVisible(not platform_parts.PORTAL)
+        self.wayland_crossing_note.setVisible(platform_parts.PORTAL)
         return module
 
     def _redirect_text(self) -> str:
@@ -2273,7 +2273,7 @@ class WindowsApplication(QWidget):
         key = TRIGGER_KEYS.get(config.trigger_key, config.trigger_key)
         self.crossing_ledger.reflect(settings, all_layout, labels, chosen, self._live, key, legacy)
         self.dragging_switch.setEnabled(bool(self._ways_in() & {"edge", "part", "corner"}))
-        self.pointer_module.setVisible(not platform_parts.WAYLAND)
+        self.pointer_module.setVisible(not platform_parts.PORTAL)
         self.resistance_module.setVisible(True)
         self.shortcut_tile.blockSignals(True)
         try:
@@ -2581,7 +2581,7 @@ class WindowsApplication(QWidget):
             "On Wayland the shortcut only brings input back: the desktop lets input go to another machine only "
             "when the pointer pushes through an edge, and keys on the Stays on this PC list cannot stay here "
             "while input is away.", "note", wrap=True)
-        self.wayland_shortcut_note.setVisible(platform_parts.WAYLAND)
+        self.wayland_shortcut_note.setVisible(platform_parts.PORTAL)
         module.body.addWidget(self.wayland_shortcut_note)
         self.shortcut_target_choice = widgets.Choice(
             (("last", "Last machine"), ("next", "Next in order"), ("ticked", "Next among ticked")),
