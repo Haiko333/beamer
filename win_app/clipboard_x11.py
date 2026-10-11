@@ -1,4 +1,4 @@
-"""Linux X11 clipboard access through Qt's QClipboard, the same four functions as clipboard_win.py.
+"""Linux X11 clipboard access through Qt's QClipboard, the same functions as clipboard_win.py.
 
 On X11 a clipboard is not a store but a promise: the owner keeps the data and answers other
 apps' requests for it from its own event loop. QClipboard therefore must only be touched on the
@@ -32,6 +32,10 @@ TIMEOUT_SECONDS = 2.0
 # on every switch.
 _change_counter = 0
 _synced_counter = None
+# Moves once for each change of the clipboard, Beamer's own writes included: at the write itself
+# for those, so the receiver's mark taken straight after is already past it, and at dataChanged
+# for another app's copy. None until dataChanged is listened for.
+_stamp = 0
 _own_token = 0
 _connected_to = None
 
@@ -111,12 +115,15 @@ def _is_own_write(clipboard) -> bool:
 
 
 def _on_data_changed() -> None:
-    global _change_counter, _synced_counter
+    global _change_counter, _synced_counter, _stamp
     was_synced = _synced_counter == _change_counter
     _change_counter += 1
+    own = _is_own_write(QGuiApplication.clipboard())
+    if not own:
+        _stamp += 1
     # dataChanged may be delivered during setMimeData or later from the event loop: _write covers
     # the first, this covers the second, carrying the marker forward only if nothing else changed.
-    if was_synced and _is_own_write(QGuiApplication.clipboard()):
+    if was_synced and own:
         _synced_counter = _change_counter
 
 
@@ -167,7 +174,7 @@ def _changed() -> Tuple[Optional[str], Optional[bytes]]:
 
 
 def _write(text: Optional[str], png: Optional[bytes]) -> bool:
-    global _own_token, _synced_counter
+    global _own_token, _synced_counter, _stamp
     _connect()
     mime = QMimeData()
     if text is not None:
@@ -176,6 +183,7 @@ def _write(text: Optional[str], png: Optional[bytes]) -> bool:
     if png is not None:
         mime.setData(PNG_MIME, png)
     _own_token += 1
+    _stamp += 1
     mime.setData(OWN_FORMAT, str(_own_token).encode())
     QGuiApplication.clipboard().setMimeData(mime)
     _synced_counter = _change_counter
@@ -193,6 +201,23 @@ def changed_contents() -> Tuple[Optional[str], Optional[bytes]]:
     to or written from the other machine. Either way the current contents count as sent from here
     on."""
     return _on_gui(_changed, default=(None, None))
+
+
+def change_stamp() -> Optional[int]:
+    """A number that moves whenever the clipboard changes, Beamer's own writes included, or None
+    until the clipboard is listened to. Read without waiting: the sender asks under its lock, so
+    the listening is only asked for here, and begins on the GUI thread's next turn. Without this
+    a machine that is let go never sends back what was copied on it (core/receiver.py)."""
+    app = QGuiApplication.instance()
+    if app is None:
+        return None
+    if _connected_to is not app:
+        if QThread.currentThread() == app.thread():
+            _connect()
+        else:
+            _runner_for(app).run.emit(_Job(_connect, (), None))
+            return None
+    return _stamp
 
 
 def forget_sync() -> None:

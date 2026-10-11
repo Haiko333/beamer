@@ -148,6 +148,32 @@ class ClipboardX11Test(unittest.TestCase):
         self.cb._on_data_changed()
         self.assertEqual(self.cb.changed_contents(), ("theirs", None))
 
+    def test_the_stamp_moves_for_another_apps_copy(self):
+        first = self.cb.change_stamp()
+        self.assertIsNotNone(first)
+        self.outside_text("copied here")
+        self.app.processEvents()
+        self.assertNotEqual(self.cb.change_stamp(), first)
+
+    def test_the_stamp_moves_once_for_beamers_own_write_and_not_again_for_its_announcement(self):
+        before = self.cb.change_stamp()
+        self.assertTrue(self.cb.set_contents("from a peer", None))
+        after = self.cb.change_stamp()
+        self.assertNotEqual(after, before)
+        self.app.processEvents()  # dataChanged for that same write
+        self.assertEqual(self.cb.change_stamp(), after)
+        self.outside_text("then copied here")
+        self.app.processEvents()
+        self.assertNotEqual(self.cb.change_stamp(), after)
+
+    def test_a_worker_asking_first_is_told_none_and_the_listening_begins(self):
+        self.cb.change_stamp()
+        self.clipboard.dataChanged.disconnect(self.cb._on_data_changed)
+        self.cb._connected_to = None
+        self.assertIsNone(self.on_worker(self.cb.change_stamp))
+        self.spin_until(lambda: self.cb._connected_to is self.app)
+        self.assertIsNotNone(self.on_worker(self.cb.change_stamp))
+
     def test_forget_sync_sends_again(self):
         self.outside_text("once")
         self.assertEqual(self.cb.changed_contents(), ("once", None))
