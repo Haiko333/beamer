@@ -66,6 +66,9 @@ def child(mode: str, config: Path) -> None:
     if mode == "x11":
         x11_child()
         return
+    if mode == "evdev":
+        evdev_child(config)
+        return
 
     import kvm_bridge_win
     from core.receiver import ServerState
@@ -131,6 +134,58 @@ def child(mode: str, config: Path) -> None:
             kvm_bridge_win.main()
         except SystemExit as exit_:
             assert exit_.code in (0, None), exit_.code
+    loaded = [name for name in WINDOWS_ONLY if name in sys.modules and name not in X11_ALLOWED]
+    assert not loaded, f"Windows-only modules imported: {loaded}"
+    print("ok")
+
+
+def evdev_child(config: Path) -> None:
+    """A Wayland desktop with no RemoteDesktop portal: the evdev parts, with no device made and no
+    compositor socket asked."""
+    from PySide6.QtWidgets import QApplication
+
+    import desktop_wlroots
+    import inject_uinput
+
+    made = []
+
+    def no_devices():
+        made.append(True)
+        raise PermissionError(13, "Permission denied")
+
+    inject_uinput._connect = no_devices
+    desktop_wlroots.use(None)
+
+    import kvm_bridge_win
+    import platform_parts
+
+    assert platform_parts.BACKEND == "evdev" and platform_parts.WAYLAND is True and platform_parts.PORTAL is False
+    assert [platform_parts.injector.__name__, platform_parts.clipboard.__name__, platform_parts.desktop.__name__,
+            platform_parts.autostart.__name__] == ["inject_uinput", "clipboard_wl", "desktop_wlroots", "autostart_x11"]
+    app = QApplication([])
+    window = kvm_bridge_win.WindowsApplication(config)
+    window.start()
+    assert window.windowTitle() == "Beamer"
+    assert window._identity()["platform"] == "linux"
+    # None of what the portals take away applies: the shortcut sends input out, the pointer's
+    # speed is this machine's to set, and a full-screen app can hold the edges.
+    assert window.wayland_shortcut_note.isHidden() and window.wayland_crossing_note.isHidden()
+    assert not window.hold_switch.isHidden() and not window.pointer_module.isHidden()
+    # The two rows that say whether this machine can drive and be driven are shown, and the
+    # injector's row is wired: a machine that may not make its devices says so there.
+    assert window.permission_state is not None and window.permissions_module is not None
+    inject_uinput.start()
+    assert made, "the injector never tried to make its devices"
+    status, detail = window.permission_state.status("remote")
+    assert status == "unavailable" and "udev rule" in detail, (status, detail)
+    # A peer's input with no devices is dropped, not raised into the link.
+    platform_parts.injector.inject_key("a", True, "a")
+    platform_parts.injector.inject_mouse_move(1, 1)
+    platform_parts.injector.release_all()
+    assert platform_parts.desktop.monitors()
+    window.reload_config()
+    window.quit()
+    window.deleteLater()
     loaded = [name for name in WINDOWS_ONLY if name in sys.modules and name not in X11_ALLOWED]
     assert not loaded, f"Windows-only modules imported: {loaded}"
     print("ok")
@@ -214,6 +269,29 @@ class LinuxStartTest(unittest.TestCase):
                     )
                     self.assertIsNotNone(measurement)
                     print(f"Offscreen source first paint: {measurement.group(1)} seconds")
+
+    @unittest.skipIf(sys.platform == "win32", "a faked platform breaks the Windows stdlib")
+    def test_without_a_remote_desktop_portal_the_evdev_parts_start_and_say_what_is_missing(self):
+        try:
+            import PySide6  # noqa: F401
+        except ImportError:
+            self.skipTest("needs PySide6")
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "settings.json"
+            (Path(directory) / "config.json").write_text(json.dumps({
+                "host": "192.0.2.20", "port": PORT, "auth_token": "synthetic", "paired_with": "MacBook Pro",
+                "mac_host": "192.0.2.10", "mac_return_edge": "left",
+                "allow_mac_to_drive": True, "send_to_mac": True,
+            }))
+            env = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_CONFIG_HOME=directory, XDG_SESSION_TYPE="wayland",
+                       BEAMER_BACKEND="evdev")
+            env.pop("LOCALAPPDATA", None)
+            done = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "evdev", str(config)],
+                env=env, capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("ok", done.stdout)
 
     @unittest.skipIf(sys.platform == "win32", "a faked platform breaks the Windows stdlib")
     def test_on_x11_the_x11_parts_start_and_the_receiver_listens(self):
