@@ -251,6 +251,27 @@ class SocketTest(unittest.TestCase):
         ipc.move(3, 4)
         self.assertEqual(seen, ["dispatch hl.dsp.cursor.move({x=1, y=2})", "dispatch movecursor 1 2", "dispatch movecursor 3 4"])
 
+    def test_hyprland_keyboard_and_pointer_setting(self):
+        seen = []
+        devices = {"keyboards": [
+            {"name": "at-translated-set-2-keyboard", "layout": "us", "variant": "", "main": True, "active_layout_index": 0},
+            {"name": "beamer-virtual-keyboard", "layout": "fr,us", "variant": "bepo,", "options": "", "active_layout_index": 1},
+        ]}
+
+        def answer(link):
+            command = link.recv(4096).decode()
+            seen.append(command)
+            link.sendall(json.dumps(devices).encode() if command == "j/devices" else b"ok")
+
+        ipc = desktop.Hyprland(self.serve(answer))
+        mine = ipc.keyboard("Beamer virtual keyboard")
+        self.assertEqual((mine["layout"], mine["variant"], mine["group"]), ("fr,us", "bepo,", 1))
+        self.assertEqual(ipc.keyboard()["layout"], "us")  # the main one when none is named
+        self.assertEqual(ipc.keyboard("Not there")["layout"], "us")
+        self.assertIsNone(desktop.hyprland_keyboard({"keyboards": []}))
+        ipc.plain_pointer("Beamer virtual pointer", 0x0BEA, 2)
+        self.assertEqual(seen[-1], 'eval hl.device({name="beamer-virtual-pointer", accel_profile="flat"})')
+
     def test_hyprland_refusing_a_move_is_an_error(self):
         ipc = desktop.Hyprland(self.serve(lambda link: (link.recv(4096), link.sendall(b"Invalid dispatcher"))))
         with self.assertRaises(OSError):
@@ -266,7 +287,7 @@ class SocketTest(unittest.TestCase):
             seen.append((header[:6], kind, payload))
             body = json.dumps({
                 desktop.Sway.GET_OUTPUTS: [{"active": True, "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080}}],
-                desktop.Sway.RUN_COMMAND: [{"success": payload.startswith("seat")}],
+                desktop.Sway.RUN_COMMAND: [{"success": payload.startswith(("seat", "input"))}],
                 desktop.Sway.GET_TREE: {"nodes": [{"focused": True, "fullscreen_mode": 1, "app_id": "mpv"}]},
             }[kind]).encode()
             link.sendall(b"i3-ipc" + struct.pack("<II", len(body), kind) + body)
@@ -278,6 +299,15 @@ class SocketTest(unittest.TestCase):
         self.assertEqual(seen[-1], (b"i3-ipc", desktop.Sway.RUN_COMMAND, "seat - cursor set 640 480"))
         with self.assertRaises(OSError):
             ipc.cursor()
+        ipc.plain_pointer("Beamer virtual pointer", 0x0BEA, 2)
+        self.assertEqual(seen[-1][2], 'input "3050:2:Beamer_virtual_pointer" accel_profile flat')
+
+    def test_sway_names_its_layout_only_as_people_read_it(self):
+        inputs = [{"type": "pointer", "name": "Mouse"},
+                  {"type": "keyboard", "name": "AT Keyboard", "xkb_layout_names": ["French (AZERTY)", "English (US)"],
+                   "xkb_active_layout_index": 1}]
+        self.assertEqual(desktop.sway_keyboard(inputs), {"descriptions": ["French (AZERTY)", "English (US)"], "group": 1})
+        self.assertIsNone(desktop.sway_keyboard([{"type": "pointer"}]))
 
     def test_a_socket_that_is_not_there_is_an_error_for_the_caller_to_absorb(self):
         with self.assertRaises(OSError):

@@ -64,6 +64,38 @@ def hyprland_full_screen(window: dict) -> Optional[str]:
     return window.get("class") or window.get("initialClass") or "An app"
 
 
+def _device_slug(name: str) -> str:
+    """A device's name as Hyprland lists it: lower case, with dashes for what is not a letter or digit."""
+    return "".join(char if char.isalnum() else "-" for char in name.lower())
+
+
+def hyprland_keyboard(reply: dict, device: str = "") -> Optional[dict]:
+    """`j/devices`: the layout of the keyboard named `device` (Hyprland may give one keyboard its
+    own), else of the main one. `layout` and `variant` are XKB's names, comma separated when there
+    are several, and `group` is the one typing now."""
+    keyboards = [item for item in reply.get("keyboards") or [] if isinstance(item, dict)]
+    wanted = _device_slug(device) if device else None
+    chosen = next((item for item in keyboards if wanted and item.get("name") == wanted), None) \
+        or next((item for item in keyboards if item.get("main")), None) or (keyboards[0] if keyboards else None)
+    if chosen is None or not chosen.get("layout"):
+        return None
+    return {"layout": chosen.get("layout") or "", "variant": chosen.get("variant") or "",
+            "options": chosen.get("options") or "", "model": chosen.get("model") or "", "rules": chosen.get("rules") or "",
+            "group": int(chosen.get("active_layout_index") or 0)}
+
+
+def sway_keyboard(reply: list, device: str = "") -> Optional[dict]:
+    """`get_inputs`: sway names a layout only as people read it ("French (AZERTY)"), so that is what
+    comes back, as `descriptions`, for linux_layout to find XKB's names for."""
+    keyboards = [item for item in reply if isinstance(item, dict) and item.get("type") == "keyboard"
+                 and item.get("xkb_layout_names")]
+    chosen = next((item for item in keyboards if device and item.get("name") == device), None) \
+        or (keyboards[0] if keyboards else None)
+    if chosen is None:
+        return None
+    return {"descriptions": list(chosen["xkb_layout_names"]), "group": int(chosen.get("xkb_active_layout_index") or 0)}
+
+
 def sway_monitors(reply: list) -> List[Rect]:
     """`get_outputs`: sway's rects are already logical."""
     found = []
@@ -144,6 +176,18 @@ class Hyprland:
     def full_screen(self) -> Optional[str]:
         return hyprland_full_screen(json.loads(self.request("j/activewindow")))
 
+    def keyboard(self, device: str = "") -> Optional[dict]:
+        return hyprland_keyboard(json.loads(self.request("j/devices")), device)
+
+    def plain_pointer(self, name: str, vendor: int, product: int) -> None:
+        slug = _device_slug(name)
+        reply = ""
+        for form in ('eval hl.device({{name="{slug}", accel_profile="flat"}})', "keyword device[{slug}]:accel_profile flat"):
+            reply = self.request(form.format(slug=slug)).strip()
+            if reply == "ok":
+                return
+        raise OSError(f"Hyprland did not take the pointer's setting: {reply[:200]}")
+
 
 class Sway:
     """sway's i3 IPC: a header of the magic, the payload's length and the message type, then JSON."""
@@ -151,7 +195,7 @@ class Sway:
     name = "sway"
     tells_cursor = False
     MAGIC = b"i3-ipc"
-    RUN_COMMAND, GET_OUTPUTS, GET_TREE = 0, 3, 4
+    RUN_COMMAND, GET_OUTPUTS, GET_TREE, GET_INPUTS = 0, 3, 4, 100
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -196,6 +240,15 @@ class Sway:
 
     def full_screen(self) -> Optional[str]:
         return sway_full_screen(self.request(self.GET_TREE))
+
+    def keyboard(self, device: str = "") -> Optional[dict]:
+        return sway_keyboard(self.request(self.GET_INPUTS), device)
+
+    def plain_pointer(self, name: str, vendor: int, product: int) -> None:
+        identifier = f"{vendor}:{product}:{name.replace(' ', '_')}"
+        reply = self.request(self.RUN_COMMAND, f'input "{identifier}" accel_profile flat')
+        if not (isinstance(reply, list) and reply and all(item.get("success") for item in reply)):
+            raise OSError(f"sway did not take the pointer's setting: {reply}")
 
 
 def find_ipc(environ=None):
@@ -361,6 +414,32 @@ def set_cursor_position(x: int, y: int) -> None:
 
 def button_down(name: str) -> bool:
     return False
+
+
+def keyboard(device: str = "") -> Optional[dict]:
+    """What the compositor says of the keyboard layout (hyprland_keyboard, sway_keyboard), or None
+    when it says nothing."""
+    ipc = _found()
+    if ipc is None:
+        return None
+    try:
+        return ipc.keyboard(device)
+    except Exception as exc:
+        _failed("say which keyboard layout it has", exc)
+        return None
+
+
+def plain_pointer(name: str, vendor: int, product: int) -> None:
+    """Ask the compositor to move the pointer by exactly what the device named `name` reports, with
+    no acceleration: a peer's moves are already the distance it means, and the position noted here
+    for sway is only right if a move of ten is ten. A compositor with no socket keeps its default."""
+    ipc = _found()
+    if ipc is None:
+        return
+    try:
+        ipc.plain_pointer(name, vendor, product)
+    except Exception as exc:
+        _failed("turn off acceleration for Beamer's pointer", exc)
 
 
 def full_screen_app() -> Optional[str]:

@@ -1,7 +1,8 @@
 """The keyboard layout as XKB has it, through libxkbcommon-x11 over ctypes: which keysym a key
 gives under given modifiers and layout group, for the X11 capture (naming a key) and injection
 (finding the key that types a character). On Wayland the same Keymap is made from the text of the
-keymap the compositor hands a libei keyboard (Keymap.from_text), and only libxkbcommon is used.
+keymap the compositor hands a libei keyboard (Keymap.from_text), or compiled from the layout's
+names where the compositor only says those (Keymap.from_names), and only libxkbcommon is used.
 
 XKB, not the core keymap: the core keymap holds only two groups in a fixed place, so a third or
 fourth layout cannot be read from it, and it knows nothing of key types, so Caps Lock, Num Lock and
@@ -17,6 +18,12 @@ import ctypes.util
 from typing import Optional
 
 _libs = {}
+
+
+class _RuleNames(ctypes.Structure):
+    """struct xkb_rule_names: a NULL or empty field is the system's default for it."""
+
+    _fields_ = [(name, ctypes.c_char_p) for name in ("rules", "model", "layout", "variant", "options")]
 
 
 def _load(names=None):
@@ -35,6 +42,8 @@ def _load(names=None):
         xkb = _libs["xkb"]
         xkb.xkb_keymap_new_from_string.restype = p
         xkb.xkb_keymap_new_from_string.argtypes = [p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        xkb.xkb_keymap_new_from_names.restype = p
+        xkb.xkb_keymap_new_from_names.argtypes = [p, ctypes.POINTER(_RuleNames), ctypes.c_int]
         xkb.xkb_context_new.restype = p
         xkb.xkb_context_new.argtypes = [ctypes.c_int]
         xkb.xkb_context_unref.argtypes = [p]
@@ -106,6 +115,23 @@ class Keymap:
         if not keymap:
             self.close()
             raise RuntimeError("Could not read the keyboard layout the desktop gave")
+        self._use(keymap)
+        return self
+
+    @classmethod
+    def from_names(cls, layout: str = "", variant: str = "", options: str = "", model: str = "", rules: str = "") -> "Keymap":
+        """A keymap compiled from its names, as a compositor compiles the one it types with ("fr",
+        or "fr,us" with as many variants): for a desktop that says which layout it has but hands
+        no keymap over. An empty name is the system's default; reload() is not used."""
+        self = cls.__new__(cls)
+        (self._xkb,) = _load({"xkb": "xkbcommon"})
+        self._xcb = self._x11 = self._conn = self._keymap = self._state = None
+        self._context = self._xkb.xkb_context_new(0)
+        names = _RuleNames(*((value.encode() if value else None) for value in (rules, model, layout, variant, options)))
+        keymap = self._xkb.xkb_keymap_new_from_names(self._context, ctypes.byref(names), 0)
+        if not keymap:
+            self.close()
+            raise RuntimeError(f"There is no keyboard layout named {layout!r} {variant!r} on this machine")
         self._use(keymap)
         return self
 
