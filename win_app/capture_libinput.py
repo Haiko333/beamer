@@ -101,6 +101,9 @@ SWALLOW_SECONDS = 0.5
 LAYOUT_SECONDS = 1.0
 # libinput's scroll units for one click of a wheel.
 SCROLL_PER_CLICK = 15.0
+# At home each move told costs the sender a question to the compositor (where the pointer is), so
+# moves are added up and told this often at most. Away they are the peer's pointer: every one goes.
+HOME_MOTION_SECONDS = 1 / 60
 
 # evdev's button codes, as X numbers them for capture_x11's table.
 EVDEV_BUTTONS = {0x110: 1, 0x111: 3, 0x112: 2, 0x113: 8, 0x114: 9}
@@ -274,6 +277,9 @@ class Hooks:
         self.on_permission: Optional[Callable[..., None]] = None
         self.on_failure: Optional[Callable[[BaseException], None]] = None
         self._predicate: Optional[Callable[[], bool]] = None
+        # Whether a move made at home is told: by default, where the compositor says where the
+        # pointer is. tools/grab_probe.py, which only counts, has every one.
+        self.home_moves: Optional[Callable[[], bool]] = None
         self._thread: Optional[threading.Thread] = None
         self._watchdog: Optional[threading.Thread] = None
         self._stopping = threading.Event()
@@ -307,6 +313,7 @@ class Hooks:
         self._said: Optional[dict] = None
         self._said_at = 0.0
         self._carry = [0.0, 0.0]
+        self._home_motion_at = 0.0
         self._scroll_carry = [0.0, 0.0]
         self._next_scan = 0.0
         self._tick_at = self._clock()
@@ -688,8 +695,11 @@ class Hooks:
         elif kind == "button":
             self._button(device, event[2], event[3])
         elif kind == "motion":
-            # At home the desktop moves its own pointer; the moves are Beamer's only while away.
-            if self._grabbed:
+            # At home too, as capture_x11 reports them: the desktop moves its own pointer, and the
+            # sender measures the push on a screen edge from these. Only where the compositor says
+            # where the pointer is: a push measured against a pointer that never moves would cross
+            # from the middle of the screen.
+            if self._grabbed or (self.home_moves or desktop_wlroots.tells_cursor)():
                 self._motion(event[2], event[3])
         elif kind == "wheel":
             self._wheel(event[3] / 120.0 * WHEEL_DELTA, event[2] / 120.0 * WHEEL_DELTA)
@@ -785,6 +795,11 @@ class Hooks:
         carry = self._carry
         carry[0] += dx
         carry[1] += dy
+        if not self._grabbed:
+            now = self._clock()
+            if now - self._home_motion_at < HOME_MOTION_SECONDS:
+                return
+            self._home_motion_at = now
         whole_x, whole_y = int(carry[0]), int(carry[1])
         carry[0] -= whole_x
         carry[1] -= whole_y

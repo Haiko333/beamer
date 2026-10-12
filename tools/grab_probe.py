@@ -6,6 +6,9 @@ back at once, since a grab ends with the process that holds it.
 
     python tools/grab_probe.py list              what is in /dev/input and what this user may open
     python tools/grab_probe.py listen [SECONDS]  read without grabbing; the desktop keeps working
+    python tools/grab_probe.py devices [SECONDS] read without grabbing, and say for each device
+                                                 (its name and eventN) how many events of each
+                                                 kind libinput made of it
     python tools/grab_probe.py grab [SECONDS]    grab every device for SECONDS (5, at most 30)
     python tools/grab_probe.py hang              grab, then hang in a callback at the next key:
                                                  the watchdog must let go within two seconds
@@ -18,6 +21,7 @@ command's own Enter is let go first. During a grab both Shift keys with Esc let 
 
 import collections
 import os
+import select
 from pathlib import Path
 import signal
 import sys
@@ -56,7 +60,79 @@ def listing() -> int:
     return 0 if readable else 1
 
 
-def run(seconds: float, grab: bool, hang: bool = False, freeze: bool = False) -> int:
+def kind_of(event: tuple) -> str:
+    """What an event of libinput.py's is counted as. Never which key or button: only that one was."""
+    kind = event[0]
+    if kind in ("key", "button"):
+        return f"{kind} {'down' if event[3] else 'up'}"
+    if kind == "other":
+        import libinput
+
+        return f"{libinput.EVENT_NAMES.get(event[2], f'libinput event {event[2]}')} (not sent on)"
+    return kind
+
+
+def tally(events, counts: dict) -> dict:
+    """Add `events` to `counts`, a Counter of kinds for each device."""
+    for event in events:
+        if event[0] not in ("added", "removed"):
+            counts.setdefault(event[1], collections.Counter())[kind_of(event)] += 1
+    return counts
+
+
+def report(counts: dict, paths: dict, names: dict) -> list:
+    """One block of lines for each device read, in eventN order, the silent ones too."""
+    lines = []
+    for device, path in sorted(paths.items(), key=lambda item: int(item[1].rsplit("event", 1)[1])):
+        lines.append(f"{Path(path).name:8} {names.get(device) or '(no name)'}")
+        kinds = counts.get(device)
+        if not kinds:
+            lines.append("            nothing")
+        for kind, count in sorted((kinds or {}).items()):
+            lines.append(f"    {count:6}  {kind}")
+    return lines
+
+
+def by_device(seconds: float, system=None, context=None, clock=time.monotonic) -> int:
+    system = system or capture.System()
+    tap, natural = capture.touchpad_options()
+
+    def opener(path, flags):
+        try:
+            return system.open(path, flags)
+        except PermissionError:  # read only, as the capture itself falls back
+            return system.open(path, (flags & ~os.O_ACCMODE) | os.O_RDONLY)
+
+    context = (context or capture._libinput_context)(opener, system.close, tap, natural)
+    paths, names = {}, {}
+    try:
+        for path in system.paths():
+            name = system.name(path)
+            if name.startswith(capture.OWN_DEVICES):
+                continue
+            device = context.add(path)
+            if device is not None:
+                paths[device], names[device] = path, name
+        if not paths:
+            print("No device could be read. `list` says what this user may open.")
+            return 1
+        print(f"Reading {len(paths)} devices for {seconds:g} s without grabbing: type, move, click, scroll.", flush=True)
+        counts = {}
+        deadline = clock() + seconds
+        while True:
+            left = deadline - clock()
+            if left <= 0:
+                break
+            select.select([context.fileno()], [], [], min(left, 0.1))
+            tally(context.events(), counts)
+    finally:
+        context.close()
+    print("Done.")
+    print("\n".join(report(counts, paths, names)))
+    return 0
+
+
+def run(seconds: float, grab: bool, hang: bool = False, freeze: bool = False, hooks_class=None) -> int:
     counts = collections.Counter()
     failures = []
     away = threading.Event()
@@ -79,9 +155,12 @@ def run(seconds: float, grab: bool, hang: bool = False, freeze: bool = False) ->
     def on_motion(dx, dy):
         counts["motion"] += 1
 
-    hooks = capture.Hooks(on_key, on_mouse, on_motion,
+    hooks = (hooks_class or capture.Hooks)(on_key, on_mouse, on_motion,
                           environ=dict(os.environ, BEAMER_GRAB_MAX_SECONDS=str(seconds)) if grab else os.environ)
     hooks.grab_while(away.is_set)
+    # Every move, whatever the compositor: the app itself takes moves at home only where the
+    # compositor says where the pointer is, and a shell over SSH has no compositor to ask.
+    hooks.home_moves = lambda: True
     hooks.on_failure = lambda error: (failures.append(getattr(error, "sentence", str(error))), away.clear())
     hooks.on_permission = lambda status, detail="", retryable=False: print(f"permission: {status} {detail}".rstrip(), flush=True)
     try:
@@ -119,6 +198,9 @@ def run(seconds: float, grab: bool, hang: bool = False, freeze: bool = False) ->
         print("No event arrived.")
     for kind, count in sorted(counts.items()):
         print(f"{count:6}  {kind}")
+    if not grab and counts.get("motion"):
+        print(f"(moves at home are added up and counted {round(1 / capture.HOME_MOTION_SECONDS)} times a second at most; "
+              "`devices` counts each one)")
     return 0
 
 
@@ -129,6 +211,8 @@ def main(arguments) -> int:
         return listing()
     if command == "listen":
         return run(seconds, grab=False)
+    if command == "devices":
+        return by_device(seconds)
     if command == "grab":
         return run(seconds, grab=True)
     if command == "hang":

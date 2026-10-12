@@ -15,6 +15,8 @@ Each event is a plain tuple, as libei.py's are, with the device as an opaque key
 - ("motion", device, dx, dy): accelerated, as the pointer moves on this machine
 - ("wheel", device, y, x): a wheel, in 120ths of a click
 - ("scroll", device, y, x): two fingers on a touchpad or a button held, in libinput's scroll units
+- ("other", device, libinput's number for the event): one Beamer sends nowhere, named by
+  EVENT_NAMES; told so that what a device produces can be counted
 
 Scroll is positive down and right, as libinput has it. The library is loaded only when a Context
 is made, so this module imports anywhere."""
@@ -33,6 +35,18 @@ EVENT_KEYBOARD_KEY = 300
 EVENT_POINTER_MOTION, EVENT_POINTER_BUTTON = 400, 402
 EVENT_SCROLL_WHEEL, EVENT_SCROLL_FINGER, EVENT_SCROLL_CONTINUOUS = 404, 405, 406
 AXIS_VERTICAL, AXIS_HORIZONTAL = 0, 1
+
+# The events not sent on, for whoever counts them (tools/grab_probe.py).
+EVENT_NAMES = {
+    401: "pointer motion absolute", 403: "pointer axis (older scroll)",
+    500: "touch down", 501: "touch up", 502: "touch motion", 503: "touch cancel", 504: "touch frame",
+    600: "tablet tool axis", 601: "tablet tool proximity", 602: "tablet tool tip", 603: "tablet tool button",
+    700: "tablet pad button", 701: "tablet pad ring", 702: "tablet pad strip", 703: "tablet pad key", 704: "tablet pad dial",
+    800: "gesture swipe begin", 801: "gesture swipe update", 802: "gesture swipe end",
+    803: "gesture pinch begin", 804: "gesture pinch update", 805: "gesture pinch end",
+    806: "gesture hold begin", 807: "gesture hold end",
+    900: "switch toggle",
+}
 
 _OPEN = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p)
 _CLOSE = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
@@ -193,7 +207,7 @@ class Context:
             x = value(pointer, AXIS_HORIZONTAL) if lib.libinput_event_pointer_has_axis(pointer, AXIS_HORIZONTAL) else 0.0
             return ("wheel" if kind == EVENT_SCROLL_WHEEL else "scroll"), device, y, x
         # The older axis event doubles the scroll ones; gestures, touch and tablets are not sent on.
-        return None
+        return "other", device, kind
 
     def close(self) -> None:
         if self._context:

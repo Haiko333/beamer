@@ -170,6 +170,13 @@ class FakeKeymap:
         self.closed = True
 
 
+class TellsCursor:
+    """A compositor that says where the pointer is, as Hyprland does."""
+
+    name = "hyprland"
+    tells_cursor = True
+
+
 class Rig(unittest.TestCase):
     environ = {}
 
@@ -631,15 +638,71 @@ class EventsTest(Rig):
         self.assertEqual([capture_win.mouse_event(message, data) for message, _x, _y, data in self.mouse],
                          [("button", "left", True), ("button", "left", False), ("button", "back", True)])
 
-    def test_moves_are_beamers_only_while_input_is_away_and_fractions_add_up(self):
+    def test_a_finger_moving_on_the_touchpad_is_reported_at_home_as_it_is_away(self):
+        # What libinput sends for one finger drawing on a touchpad, nothing grabbed: the sender
+        # measures the push on a screen edge from these, as it does from capture_x11's.
+        desktop_wlroots.use(TellsCursor())
+        self.open()
+        device = self.device(TOUCHPAD)
+        self.feed(("motion", device, 5.0, 5.0))
+        self.now += 0.02
+        self.feed(("motion", device, -2.0, 3.0))
+        self.assertEqual(self.moves, [(5, 5), (-2, 3)])
+        self.assertEqual(self.system.grabs, set())
+        self.away = True
+        self.turn()
+        self.feed(("motion", device, 4.0, 0.0))
+        self.assertEqual(self.moves[-1], (4, 0))
+
+    def test_at_home_moves_are_added_up_and_told_sixty_times_a_second_at_most(self):
+        desktop_wlroots.use(TellsCursor())
+        self.open()
+        device = self.device(TOUCHPAD)
+        self.feed(*[("motion", device, 1.0, 2.0)] * 5)
+        self.assertEqual(self.moves, [(1, 2)])
+        self.now += 0.02
+        self.feed(("motion", device, 1.0, 2.0))
+        self.assertEqual(self.moves, [(1, 2), (5, 10)])
+
+    def test_away_every_move_is_told(self):
+        self.open()
+        device = self.device(TOUCHPAD)
+        self.away = True
+        self.turn()
+        self.feed(*[("motion", device, 1.0, 2.0)] * 5)
+        self.assertEqual(self.moves, [(1, 2)] * 5)
+
+    def test_where_the_compositor_cannot_say_where_the_pointer_is_moves_at_home_are_not_told(self):
+        # sway and the like: the sender would measure a push against a pointer that never moves.
         self.open()
         device = self.device(TOUCHPAD)
         self.feed(("motion", device, 5.0, 5.0))
         self.assertEqual(self.moves, [])
         self.away = True
         self.turn()
+        self.feed(("motion", device, 4.0, 0.0))
+        self.assertEqual(self.moves, [(4, 0)])
+
+    def test_whoever_asks_for_every_move_at_home_has_them_with_no_compositor_to_ask(self):
+        # tools/grab_probe.py over SSH: no compositor's socket in that shell, and the moves are
+        # what it is run to count.
+        self.hooks.home_moves = lambda: True
+        self.open()
+        self.feed(("motion", self.device(TOUCHPAD), 5.0, 5.0))
+        self.assertEqual(self.moves, [(5, 5)])
+
+    def test_fractions_of_a_move_add_up(self):
+        self.open()
+        device = self.device(TOUCHPAD)
+        self.away = True
+        self.turn()
         self.feed(("motion", device, 0.4, -0.4), ("motion", device, 0.4, -0.4), ("motion", device, 0.4, -0.4), ("motion", device, 3.0, 0.0))
         self.assertEqual(self.moves, [(1, -1), (3, 0)])
+
+    def test_an_event_beamer_sends_nowhere_is_passed_over(self):
+        self.open()
+        self.feed(("other", self.device(TOUCHPAD), 800))
+        self.assertEqual((self.keys, self.mouse, self.moves), ([], [], []))
 
     def test_a_wheel_click_and_two_fingers_on_a_touchpad_scroll_the_same_way(self):
         self.open()

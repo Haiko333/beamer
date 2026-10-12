@@ -46,6 +46,15 @@ class HeaderTest(unittest.TestCase):
                 self.assertEqual(getattr(libinput, ours), values[theirs])
         self.assertEqual((values["LIBINPUT_KEY_STATE_PRESSED"], values["LIBINPUT_BUTTON_STATE_PRESSED"]), (1, 1))
 
+    def test_the_events_not_sent_on_are_named_as_the_header_names_them(self):
+        values = enum_values(HEADER.read_text())
+        theirs = {number: name for name, number in values.items() if name.startswith("LIBINPUT_EVENT_") and number >= 300}
+        for number, ours in libinput.EVENT_NAMES.items():
+            with self.subTest(number=number):
+                self.assertIn(number, theirs)
+                words = ours.replace(" (older scroll)", "").upper().replace(" ", "_")
+                self.assertEqual("LIBINPUT_EVENT_" + words, theirs[number])
+
 
 class LibraryTest(unittest.TestCase):
     def test_every_function_bound_is_in_the_library_and_a_device_is_opened_only_through_the_caller(self):
