@@ -474,13 +474,13 @@ WTYPE_SECONDS = 1.0
 def _type_out(text: str) -> bool:
     """Type `text` through wtype, for what this layout has no key for. False when there is no
     wtype or it failed. The text is one argument after `--`: nothing in it is read as an option."""
-    path = shutil.which("wtype", path="/usr/local/bin:/usr/bin:/bin")
+    path = shutil.which("wtype", path="/usr/bin:/bin:/usr/local/bin")
     if path is None or not os.environ.get("WAYLAND_DISPLAY"):
         return False
     try:
-        return subprocess.run([path, "--", text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        return subprocess.run([path, "--", text.encode("utf-8")], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=WTYPE_SECONDS).returncode == 0
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:  # ValueError: half a surrogate pair, a NUL
         LOGGER.warning("wtype did not type (%s)", exc)
         return False
 
@@ -541,8 +541,10 @@ def inject_key(name: str, down: bool, us: Optional[str] = None) -> None:
                 # that follows finds nothing held.
                 held = _held_codes(_state.mods_down)
                 _press(devices, [(code, False) for code in held])
-                _beyond_shift(devices, name, layout, group, locks)
-                _press(devices, [(code, True) for code in held])
+                try:
+                    _beyond_shift(devices, name, layout, group, locks)
+                finally:
+                    _press(devices, [(code, True) for code in held])
                 return
         steps = plan_key(name, down, us, _state, layout, group, locks)
         if steps:
@@ -572,17 +574,19 @@ def inject_text(text: str) -> None:
         bare = KeyState()
         bare.spares, bare.chars_down = _state.spares, _state.chars_down
         _press(devices, [(code, False) for code in held])
-        run, keyed = "", True
-        for character in text + "\0":
-            has_key = character != "\0" and layout.find(character, group, locks) is not None
-            if run and (has_key != keyed or character == "\0"):
-                if keyed:
-                    _press(devices, wayland_steps(plan_text(run, bare, layout, group, locks)))
-                else:
-                    _beyond_shift(devices, run, layout, group, locks)
-                run = ""
-            run, keyed = run + character, has_key
-        _press(devices, [(code, True) for code in held])
+        try:
+            run, keyed = "", True
+            for character in text + "\0":
+                has_key = character != "\0" and layout.find(character, group, locks) is not None
+                if run and (has_key != keyed or character == "\0"):
+                    if keyed:
+                        _press(devices, wayland_steps(plan_text(run, bare, layout, group, locks)))
+                    else:
+                        _beyond_shift(devices, run, layout, group, locks)
+                    run = ""
+                run, keyed = run + character, has_key
+        finally:
+            _press(devices, [(code, True) for code in held])
 
     _play(go)
 

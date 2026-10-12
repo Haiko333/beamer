@@ -222,6 +222,50 @@ class UsLayoutTest(Rig):
         self.assertEqual(self.keys(), [(ALT_R, True), (18, True)])
 
 
+class WtypeTest(unittest.TestCase):
+    """The real `_type_out`, with no wtype run."""
+
+    def run_with(self, result=None, error=None, environ=None):
+        calls = []
+
+        def run(arguments, **options):
+            calls.append((arguments, options))
+            if error is not None:
+                raise error
+            return mock.Mock(returncode=result)
+
+        with mock.patch.object(inject.shutil, "which", lambda name, path=None: "/usr/bin/wtype"), \
+                mock.patch.object(inject.subprocess, "run", run), \
+                mock.patch.dict(inject.os.environ, {"WAYLAND_DISPLAY": "wayland-1"} if environ is None else environ, clear=True):
+            return inject._type_out("-é"), calls
+
+    def test_the_text_is_one_argument_after_two_dashes_with_a_time_limit(self):
+        typed, calls = self.run_with(result=0)
+        self.assertTrue(typed)
+        arguments, options = calls[0]
+        self.assertEqual(arguments, ["/usr/bin/wtype", "--", "-é".encode()])
+        self.assertEqual(options["timeout"], inject.WTYPE_SECONDS)
+
+    def test_a_wtype_that_fails_hangs_or_cannot_be_run_types_nothing_and_raises_nothing(self):
+        import subprocess
+
+        self.assertEqual(self.run_with(result=1)[0], False)
+        for error in (subprocess.TimeoutExpired("wtype", 1.0), OSError(2, "gone"), ValueError("embedded null byte")):
+            with self.assertLogs(inject.LOGGER, "WARNING"):
+                self.assertEqual(self.run_with(error=error)[0], False)
+
+    def test_half_a_surrogate_pair_is_not_handed_on(self):
+        with mock.patch.object(inject.shutil, "which", lambda name, path=None: "/usr/bin/wtype"), \
+                mock.patch.dict(inject.os.environ, {"WAYLAND_DISPLAY": "wayland-1"}, clear=True), \
+                mock.patch.object(inject.subprocess, "run") as run, self.assertLogs(inject.LOGGER, "WARNING"):
+            self.assertFalse(inject._type_out("\ud800"))
+        run.assert_not_called()
+
+    def test_outside_a_wayland_session_wtype_is_not_tried(self):
+        typed, calls = self.run_with(result=0, environ={})
+        self.assertEqual((typed, calls), (False, []))
+
+
 class FrenchLayoutTest(Rig):
     layout = "fr"
 
@@ -307,6 +351,14 @@ class FrenchLayoutTest(Rig):
         inject.inject_text("a@ê")
         self.assertEqual(self.keys(), [(ALT_R, False), (16, True), (16, False)] + self.stroke(11, altgr=True)
                          + self.stroke(26) + self.stroke(18) + [(ALT_R, True)])
+
+    def test_the_peers_modifiers_are_pressed_again_even_when_typing_fails(self):
+        inject.inject_key("ctrl", True)
+        self.keys()
+        with mock.patch.object(inject, "_type_out", side_effect=RuntimeError("a test")):
+            with self.assertRaises(RuntimeError):
+                inject.inject_text("λ")
+        self.assertEqual(self.keys(), [(CTRL, False), (CTRL, True)])
 
     def test_a_character_on_no_key_at_any_level_goes_through_wtype(self):
         inject.inject_key("λ", True, None)
