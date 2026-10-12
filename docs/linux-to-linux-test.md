@@ -19,9 +19,9 @@ makepkg -si
 ```
 
 The package brings its dependencies (`pyside6`, `python-pynacl`, `python-xlib`, `python-six`,
-`python-jeepney`, `python-evdev`, `libinput`, `libxkbcommon`) and the `/dev/uinput` rule, which is
-all B needs to be driven. For B to drive A as well, install the `/dev/input` rule as the note
-after installing says. Log out and in, then run `beamer`.
+`python-jeepney`, `python-evdev`, `libinput`, `libxkbcommon`). It puts no udev rule in force: the
+note after installing has the commands. Install the `/dev/uinput` rule for B to be driven, and the
+`/dev/input` one as well for B to drive A. Log out and in, then run `beamer`.
 
 ### Fedora with GNOME, a live USB included (portal back ends)
 

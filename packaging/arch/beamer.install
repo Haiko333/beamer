@@ -1,28 +1,37 @@
 post_install() {
-  udevadm control --reload 2>/dev/null
-  udevadm trigger --subsystem-match=misc --action=change 2>/dev/null
   cat <<'EOF'
-==> Beamer can be driven by another machine as it is: its rule for /dev/uinput is in force,
-    which lets every program you run type and click as you.
+==> On Hyprland, sway and other wlroots compositors Beamer needs a udev rule for each thing it
+    does. NEITHER IS IN FORCE: each opens something to every program you run, not to Beamer
+    alone, so turn on only what this machine needs. GNOME and KDE Plasma need neither.
 
-==> To DRIVE another machine from Hyprland, sway or another wlroots compositor, Beamer must
-    read the keyboards and mice in /dev/input. That rule is NOT in force. It lets every program
-    you run, not Beamer alone, read every key typed on this machine, passwords included, and
-    take the keyboard away from the desktop. Turn it on only on a machine that drives others:
+==> To BE DRIVEN by another machine: /dev/uinput, to make a virtual keyboard and mouse.
+    Every program you run can then type and click as you.
+
+      sudo install -m 644 /usr/share/doc/beamer/70-beamer-uinput.rules /etc/udev/rules.d/
+      sudo udevadm control --reload
+      sudo udevadm trigger --name-match=uinput
+
+    To take it back:
+
+      sudo rm /etc/udev/rules.d/70-beamer-uinput.rules
+      sudo udevadm control --reload
+      sudo udevadm trigger --name-match=uinput
+
+==> To DRIVE another machine: /dev/input, to read the keyboards and mice. Every program you
+    run can then read every key typed on this machine, passwords included, and take the
+    keyboard away from the desktop. Only on a machine that drives others.
 
       sudo install -m 644 /usr/share/doc/beamer/70-beamer-input.rules /etc/udev/rules.d/
       sudo udevadm control --reload
       sudo udevadm trigger --subsystem-match=input --action=change
 
-    To take it back: remove /etc/udev/rules.d/70-beamer-input.rules and run the last two again.
-    GNOME and KDE Plasma need neither rule.
+    To take it back:
+
+      sudo rm /etc/udev/rules.d/70-beamer-input.rules
+      sudo udevadm control --reload
+      sudo udevadm trigger --subsystem-match=input --action=change
 
 ==> A firewall must let in TCP 24820 and UDP 24821, or pairing fails:
       sudo ufw allow 24820/tcp && sudo ufw allow 24821/udp
 EOF
-}
-
-post_upgrade() {
-  udevadm control --reload 2>/dev/null
-  true
 }

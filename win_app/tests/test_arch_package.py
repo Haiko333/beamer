@@ -1,5 +1,5 @@
 """The Arch package (packaging/arch): it installs files that exist, depends on what
-requirements-linux.txt asks for, and leaves the rule that opens /dev/input switched off."""
+requirements-linux.txt asks for, and leaves both udev rules as examples to turn on by hand."""
 
 import re
 import unittest
@@ -44,20 +44,24 @@ class ArchPackageTest(unittest.TestCase):
         for name in names:
             self.assertIn(ARCH_NAMES[name], depends)
 
-    def test_the_rule_that_opens_dev_input_is_an_example_and_not_in_force(self):
+    def test_neither_udev_rule_is_in_force(self):
         places = dict(installs())
-        self.assertIn("/usr/lib/udev/rules.d/", places["packaging/linux/70-beamer-uinput.rules"])
-        self.assertNotIn("rules.d", places["packaging/linux/70-beamer-input.rules"])
-        self.assertIn("/usr/share/doc/", places["packaging/linux/70-beamer-input.rules"])
+        for rule in ("70-beamer-uinput.rules", "70-beamer-input.rules"):
+            place = places["packaging/linux/" + rule]
+            self.assertNotIn("rules.d", place)
+            self.assertIn("/usr/share/doc/", place)
 
     def test_the_launcher_starts_the_shell_where_the_package_puts_it(self):
         launcher = (ROOT / "packaging" / "linux" / "beamer").read_text(encoding="utf-8")
         self.assertIn("/usr/share/beamer/win_app/kvm_bridge_win.py", launcher)
         self.assertIn('cp -r core win_app VERSION "$pkgdir/usr/share/beamer/"', pkgbuild())
 
-    def test_the_note_shown_after_installing_says_what_the_input_rule_opens(self):
+    def test_the_note_shown_after_installing_says_what_each_rule_opens_and_how_to_take_it_back(self):
         note = (ARCH / "beamer.install").read_text(encoding="utf-8")
-        self.assertIn("70-beamer-input.rules", note)
+        for rule in ("70-beamer-uinput.rules", "70-beamer-input.rules"):
+            self.assertIn(f"sudo install -m 644 /usr/share/doc/beamer/{rule} /etc/udev/rules.d/", note)
+            self.assertIn(f"sudo rm /etc/udev/rules.d/{rule}", note)
+        self.assertIn("type and click as you", note)
         self.assertIn("passwords", note)
 
 

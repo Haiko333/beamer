@@ -466,9 +466,9 @@ They take two permissions, each its own udev rule, so that a machine has only th
   Flatpak does not have: run Beamer from source there (`python win_app/kvm_bridge_win.py`).
 - On Arch Linux, [`packaging/arch`](packaging/arch/PKGBUILD) builds a package that does this:
   `cd packaging/arch && makepkg -si`, then `beamer`. It builds what is pushed to this fork's branch,
-  not the working tree. It puts the `/dev/uinput` rule in force, and leaves the `/dev/input` one in
-  `/usr/share/doc/beamer` as an example to install by hand, for the reason given above; the note
-  shown after installing has the commands.
+  not the working tree. It puts neither udev rule in force: both are left in `/usr/share/doc/beamer` as
+  examples to install by hand, for the reasons given above, and the note shown after installing
+  says what each opens and has the commands to turn it on and to take it back.
 - To start Beamer with a Hyprland session, add `exec-once = beamer --hidden` to `hyprland.conf`
   (with the Arch package; from source, the full path of the Python and of
   `win_app/kvm_bridge_win.py` in place of `beamer`). Hyprland by itself does not run the XDG

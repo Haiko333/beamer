@@ -50,9 +50,9 @@ package() {
   install -Dm644 flatpak/uk.co.kalkman.beamer.desktop "$pkgdir/usr/share/applications/uk.co.kalkman.beamer.desktop"
   install -Dm644 Beamer.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/uk.co.kalkman.beamer.svg"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-  # To be driven: in force. To drive others: an example, since it opens every key typed to every
-  # program of the person signed in; beamer.install says how to turn it on.
-  install -Dm644 packaging/linux/70-beamer-uinput.rules "$pkgdir/usr/lib/udev/rules.d/70-beamer-uinput.rules"
+  # Both rules are examples: each opens something to every program of the person signed in, so
+  # each is turned on by hand; beamer.install says how and what it opens.
+  install -Dm644 packaging/linux/70-beamer-uinput.rules "$pkgdir/usr/share/doc/beamer/70-beamer-uinput.rules"
   install -Dm644 packaging/linux/70-beamer-input.rules "$pkgdir/usr/share/doc/beamer/70-beamer-input.rules"
   python -m compileall -q "$pkgdir/usr/share/beamer" -s "$pkgdir" -p /
 }
