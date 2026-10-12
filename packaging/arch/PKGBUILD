@@ -1,0 +1,58 @@
+# Beamer from this fork's linux-wlroots branch, for Arch Linux: run from source under the system's
+# Python, which is what the evdev back ends need (the Flatpak cannot open /dev/uinput).
+#
+#   cd packaging/arch && makepkg -si
+#
+# makepkg fetches the branch from GitHub, so it builds what is pushed, not the working tree.
+
+pkgname=beamer-git
+pkgver=1.5.2.r0.g0000000
+pkgrel=1
+pkgdesc="One keyboard and one mouse or trackpad for the computers on a network"
+arch=('any')
+url="https://github.com/Haiko333/beamer"
+license=('GPL-3.0-only')
+depends=(
+  'python'
+  'pyside6'
+  'python-pynacl'
+  'python-xlib'
+  'python-six'
+  'python-jeepney'
+  'python-evdev'
+  'libinput'
+  'libxkbcommon'
+)
+makedepends=('git')
+optdepends=(
+  'wl-clipboard: the clipboard on Hyprland, sway and other wlroots compositors'
+  'wtype: characters the keyboard layout has no key for, on those compositors'
+  'libei: GNOME and KDE Plasma under Wayland'
+)
+provides=('beamer')
+conflicts=('beamer')
+install=beamer.install
+source=("beamer::git+https://github.com/Haiko333/beamer.git#branch=linux-wlroots")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd beamer
+  printf '%s.r%s.g%s' "$(cat VERSION)" "$(git rev-list --count v1.5.2..HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+package() {
+  cd beamer
+  install -d "$pkgdir/usr/share/beamer"
+  cp -r core win_app VERSION "$pkgdir/usr/share/beamer/"
+  rm -rf "$pkgdir/usr/share/beamer/core/tests" "$pkgdir/usr/share/beamer/win_app/tests"
+  install -Dm644 tools/grab_probe.py "$pkgdir/usr/share/beamer/tools/grab_probe.py"
+  install -Dm755 packaging/linux/beamer "$pkgdir/usr/bin/beamer"
+  install -Dm644 flatpak/uk.co.kalkman.beamer.desktop "$pkgdir/usr/share/applications/uk.co.kalkman.beamer.desktop"
+  install -Dm644 Beamer.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/uk.co.kalkman.beamer.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  # To be driven: in force. To drive others: an example, since it opens every key typed to every
+  # program of the person signed in; beamer.install says how to turn it on.
+  install -Dm644 packaging/linux/70-beamer-uinput.rules "$pkgdir/usr/lib/udev/rules.d/70-beamer-uinput.rules"
+  install -Dm644 packaging/linux/70-beamer-input.rules "$pkgdir/usr/share/doc/beamer/70-beamer-input.rules"
+  python -m compileall -q "$pkgdir/usr/share/beamer" -s "$pkgdir" -p /
+}

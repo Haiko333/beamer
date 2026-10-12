@@ -464,6 +464,11 @@ They take two permissions, each its own udev rule, so that a machine has only th
   the portal ones wherever the desktop has the RemoteDesktop portal, as GNOME and KDE do.
 - These back ends need the `python-evdev` package and direct access to `/dev/uinput`, which the
   Flatpak does not have: run Beamer from source there (`python win_app/kvm_bridge_win.py`).
+- On Arch Linux, [`packaging/arch`](packaging/arch/PKGBUILD) builds a package that does this:
+  `cd packaging/arch && makepkg -si`, then `beamer`. It builds what is pushed to this fork's branch,
+  not the working tree. It puts the `/dev/uinput` rule in force, and leaves the `/dev/input` one in
+  `/usr/share/doc/beamer` as an example to install by hand, for the reason given above; the note
+  shown after installing has the commands.
 - A firewall on the Linux machine must let in TCP 24820 for input and UDP 24821 for pairing, or
   pairing fails. With `ufw`: `sudo ufw allow 24820/tcp` and `sudo ufw allow 24821/udp`.
 

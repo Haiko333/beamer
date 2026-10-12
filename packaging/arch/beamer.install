@@ -1,0 +1,28 @@
+post_install() {
+  udevadm control --reload 2>/dev/null
+  udevadm trigger --subsystem-match=misc --action=change 2>/dev/null
+  cat <<'EOF'
+==> Beamer can be driven by another machine as it is: its rule for /dev/uinput is in force,
+    which lets every program you run type and click as you.
+
+==> To DRIVE another machine from Hyprland, sway or another wlroots compositor, Beamer must
+    read the keyboards and mice in /dev/input. That rule is NOT in force. It lets every program
+    you run, not Beamer alone, read every key typed on this machine, passwords included, and
+    take the keyboard away from the desktop. Turn it on only on a machine that drives others:
+
+      sudo install -m 644 /usr/share/doc/beamer/70-beamer-input.rules /etc/udev/rules.d/
+      sudo udevadm control --reload
+      sudo udevadm trigger --subsystem-match=input --action=change
+
+    To take it back: remove /etc/udev/rules.d/70-beamer-input.rules and run the last two again.
+    GNOME and KDE Plasma need neither rule.
+
+==> A firewall must let in TCP 24820 and UDP 24821, or pairing fails:
+      sudo ufw allow 24820/tcp && sudo ufw allow 24821/udp
+EOF
+}
+
+post_upgrade() {
+  udevadm control --reload 2>/dev/null
+  true
+}
