@@ -1,6 +1,7 @@
 """libinput.py's numbers against the installed header, and its functions against the installed
 library: the binding is ctypes, so nothing else would notice either drifting. No device is opened."""
 
+import ctypes
 from pathlib import Path
 import re
 import sys
@@ -57,6 +58,16 @@ class HeaderTest(unittest.TestCase):
 
 
 class LibraryTest(unittest.TestCase):
+    def test_the_library_is_called_without_letting_go_of_the_interpreter(self):
+        # Each call through CDLL hands the interpreter to whichever thread wants it, some nine
+        # times an event: with the window or the link busy, a mouse at a thousand reports a second
+        # outruns the loop and libinput says it lags. None of these calls waits for anything.
+        try:
+            lib = libinput._load()
+        except RuntimeError as exc:
+            self.skipTest(str(exc))
+        self.assertIsInstance(lib, ctypes.PyDLL)
+
     def test_every_function_bound_is_in_the_library_and_a_device_is_opened_only_through_the_caller(self):
         try:
             libinput._load()

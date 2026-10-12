@@ -65,7 +65,10 @@ def _load():
         return _lib
     path = ctypes.util.find_library("input") or "libinput.so.10"
     try:
-        lib = ctypes.CDLL(path)
+        # PyDLL: the calls keep the interpreter. None waits (the descriptors are read without
+        # blocking), and through CDLL each of the nine or so an event takes would hand the
+        # interpreter to a busy window or link thread, milliseconds at a time.
+        lib = ctypes.PyDLL(path)
     except OSError as exc:
         raise RuntimeError("libinput is not installed; Beamer reads the keyboard and mouse through it") from exc
     p, u32, dbl, i = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_double, ctypes.c_int

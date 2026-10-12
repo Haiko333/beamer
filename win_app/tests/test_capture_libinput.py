@@ -890,6 +890,38 @@ class EventsTest(Rig):
         self.feed(("motion", self.device(TOUCHPAD), 5.0, 5.0))
         self.assertEqual(self.moves, [(5, 5)])
 
+    def test_moves_that_arrived_together_are_told_as_one(self):
+        # A mouse that reports a thousand times a second, read by a loop that was kept waiting:
+        # one message for the other machine, not one for each report.
+        self.open()
+        self.away = True
+        self.turn()
+        mouse = self.device(MOUSE)
+        self.hooks._take([("motion", mouse, 3.0, 1.0), ("motion", mouse, 2.0, -4.0), ("motion", mouse, 1.0, 1.0)])
+        self.assertEqual(self.moves, [(6, -2)])
+
+    def test_a_click_between_two_moves_stays_between_them(self):
+        self.open()
+        self.away = True
+        self.turn()
+        mouse = self.device(MOUSE)
+        order = []
+        self.hooks._on_motion = lambda dx, dy: order.append(("move", dx, dy))
+        self.hooks._on_mouse = lambda *event: order.append("button") or True
+        self.hooks._take([("motion", mouse, 1.0, 0.0), ("motion", mouse, 2.0, 0.0), ("button", mouse, BTN_LEFT, True),
+                          ("motion", mouse, 5.0, 0.0), ("button", mouse, BTN_LEFT, False)])
+        self.assertEqual(order, [("move", 3, 0), "button", ("move", 5, 0), "button"])
+
+    def test_an_event_that_cannot_be_passed_on_does_not_lose_the_ones_after_it(self):
+        self.open()
+        self.away = True
+        self.turn()
+        mouse = self.device(MOUSE)
+        with mock.patch.object(self.hooks, "_button", side_effect=RuntimeError("the app refused")), \
+                self.assertLogs(capture.LOGGER, "ERROR"):
+            self.hooks._take([("button", mouse, BTN_LEFT, True), ("motion", mouse, 4.0, 0.0)])
+        self.assertEqual(self.moves, [(4, 0)])
+
     def test_fractions_of_a_move_add_up(self):
         self.open()
         device = self.device(TOUCHPAD)

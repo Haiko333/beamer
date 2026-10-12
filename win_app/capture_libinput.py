@@ -272,6 +272,19 @@ def max_grab_seconds(environ=None) -> Optional[float]:
     return seconds if seconds > 0 else None
 
 
+def _merged(events: List[tuple]) -> List[tuple]:
+    """`events` with each run of moves added up into one. A key, a button or a scroll between two
+    moves stays between them."""
+    merged: List[tuple] = []
+    for event in events:
+        if event[0] == "motion" and merged and merged[-1][0] == "motion":
+            last = merged[-1]
+            merged[-1] = ("motion", event[1], last[2] + event[2], last[3] + event[3])
+        else:
+            merged.append(event)
+    return merged
+
+
 class Hooks:
     """The capture thread. `on_key(name, down, vk, us)`, `on_mouse(message, x, y, data)` and
     `on_motion(dx, dy)` are called on it, as capture_x11's are; `grab_while(predicate)` says when
@@ -439,12 +452,7 @@ class Hooks:
                     os.read(self._wake_read, 64)
                 except OSError:
                     pass
-                for event in self._context.events():
-                    try:
-                        self._handle(event)
-                    except Exception:
-                        # One key the app could not take is not the end of the capture.
-                        LOGGER.exception("An input event could not be passed on")
+                self._take(self._context.events())
                 self._settle(now)
                 if now >= self._next_scan:
                     self._scan()
@@ -743,6 +751,16 @@ class Hooks:
         self._fail(CaptureUnavailable(sentence))
 
     # -- events ------------------------------------------------------------------
+
+    def _take(self, events: List[tuple]) -> None:
+        """What one turn of the loop read. Moves that arrived together are one move: a mouse may
+        report a thousand times a second, and each move told is a message to the other machine."""
+        for event in _merged(events):
+            try:
+                self._handle(event)
+            except Exception:
+                # One key the app could not take is not the end of the capture.
+                LOGGER.exception("An input event could not be passed on")
 
     def _handle(self, event: tuple) -> None:
         kind, device = event[0], event[1]
