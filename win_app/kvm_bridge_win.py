@@ -653,23 +653,7 @@ class WindowsApplication(QWidget):
                 "capture", status, detail, retryable,
             )
             self.permission_state.bind_requester("capture", self.hooks.request_again)
-        # X11 cannot swallow one event, only grab the devices; the capture thread holds the grab
-        # for as long as input is away.
-        grab_while = getattr(self.hooks, "grab_while", None)
-        if grab_while is not None:
-            grab_while(lambda: self.sender.redirecting)
-            self.hooks.on_failure = self._capture_stopped
-        # A capture that reads AltGr and dead keys itself sends what they type as text, to a peer
-        # that types text.
-        text_while = getattr(self.hooks, "text_while", None)
-        if text_while is not None:
-            text_while(self.sender.types_text)
-        # Wayland: only the desktop captures input, at barriers on this machine's zones, and it
-        # may end a capture itself, which brings input home.
-        if hasattr(self.hooks, "barriers_from"):
-            self.hooks.barriers_from(self.sender.zone_models)
-            self.hooks.on_home = lambda: self.sender.set_redirecting(False)
-            self.sender.input_held = lambda: self.hooks.holding
+        self._wire_capture()
         if hasattr(platform_parts.injector, "on_problem"):
             platform_parts.injector.on_problem = lambda sentence: self.bridge.alert.emit("Beamer", sentence)
         if self.permission_state is not None and hasattr(platform_parts.injector, "on_permission"):
@@ -4088,6 +4072,27 @@ class WindowsApplication(QWidget):
             self._sending_detail = f"This PC's keyboard could not be captured: {exc}"
             return
         self.sender.start(config)
+
+    def _wire_capture(self) -> None:
+        """What each Linux capture asks of the sender, by what the capture has: one method, so every
+        back end's wiring is tested without a desktop."""
+        # X11 cannot swallow one event, only grab the devices; the capture thread holds the grab
+        # for as long as input is away.
+        grab_while = getattr(self.hooks, "grab_while", None)
+        if grab_while is not None:
+            grab_while(lambda: self.sender.redirecting)
+            self.hooks.on_failure = self._capture_stopped
+        # A capture that reads AltGr and dead keys itself sends what they type as text, to a peer
+        # that types text.
+        text_while = getattr(self.hooks, "text_while", None)
+        if text_while is not None:
+            text_while(self.sender.types_text)
+        # Wayland: only the desktop captures input, at barriers on this machine's zones, and it
+        # may end a capture itself, which brings input home.
+        if hasattr(self.hooks, "barriers_from"):
+            self.hooks.barriers_from(self.sender.zone_models)
+            self.hooks.on_home = lambda: self.sender.set_redirecting(False)
+            self.sender.input_held = lambda: self.hooks.holding
 
     def _capture_stopped(self, error: BaseException) -> None:
         """On the capture thread, when capture ended on its own (the X server gone, a stalled
