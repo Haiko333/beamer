@@ -535,6 +535,7 @@ class WindowsApplication(QWidget):
         self.bridge.update.connect(self._on_update)
         self.bridge.rules_ready.connect(self._listen)
         self.bridge.permission.connect(self._on_permission)
+        self.bridge.permission.connect(self._on_drive_permission)
         self._update = None
         self._effects_failed = False
         self._code_shown = False
@@ -987,6 +988,12 @@ class WindowsApplication(QWidget):
             self._on_permission(direction, *self.permission_state.status(direction),
                                 self.permission_state.can_ask_again(direction))
         return module
+
+    def _on_drive_permission(self, direction: str, status: str, detail: str, retryable: bool) -> None:
+        """Whether this machine can play a peer's input has changed (the desktop's answer, or the
+        devices it plays through): every linked peer is told whether it may still drive this one."""
+        if direction == "remote":
+            self.server.peers_changed()
 
     def _on_permission(self, direction: str, status: str, detail: str, retryable: bool) -> None:
         rows = getattr(self, "permission_rows", {})

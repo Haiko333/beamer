@@ -361,6 +361,9 @@ class _Link:
         self.response_time = ResponseTime()
         self.next_response_probe = time.monotonic() + 1.0
         self.allow_drive = allow_drive
+        # What this link was last told of `accepts`: `allow_drive`, unless this machine cannot play
+        # a peer's input at all.
+        self.accepts = allow_drive
         self.route = 0              # the last route accepted on this link
         self.held = {}              # ("key" or "button", name): `us`, what the owner holds down here
         self.closed = threading.Event()
@@ -431,7 +434,10 @@ class LinkResponder:
     - `book`: a PeerBook over the app's settings.
     - `identity()`: this machine as its `welcome` says it, a dict of `id` (16 bytes), `name`,
       `platform`, `app`, `caps` and optionally `hw`; read at each handshake.
-    - `injector`, `desktop`, `clipboard`, `unlock`: the platform modules.
+    - `injector`, `desktop`, `clipboard`, `unlock`: the platform modules. An injector may have
+      `available()`: False while it cannot play input, and then no peer is told it may drive this
+      machine (`accepts` is false and a take is refused as `not_allowed`); `peers_changed()` tells
+      the peers when that changes.
       The injector also needs `inject_text(chars)` for the `text` capability. The clipboard needs
       `get_contents()`, `set_contents(text, image)` and `change_stamp()`, a value that changes
       whenever the clipboard does; without it, a machine let go never sends its clipboard.
@@ -755,15 +761,18 @@ class LinkResponder:
                 self._answer(connection, host, session.seal(protocol.invalid_hello_v6()))
                 return None
             allow_drive = entry.get("allow_drive") is True
+            accepts = allow_drive and self._can_inject()
             welcome = protocol.welcome_v6(
-                own_id, identity["name"], identity["platform"], identity["app"], identity["caps"], allow_drive, self._hardware_towards(host, identity)
+                own_id, identity["name"], identity["platform"], identity["app"], identity["caps"], accepts, self._hardware_towards(host, identity)
             )
             protocol.send_msg(connection, session, welcome)
         except (socket.timeout, protocol.ConnectionClosed, protocol.ProtocolError, OSError) as exc:
             LOGGER.info("Handshake with %s ended: %s", host, exc)
             return None
-        return _Link(connection, session, hello["id"], key_id, host, hello["name"], hello["caps"], own_id, identity["caps"], allow_drive,
+        link = _Link(connection, session, hello["id"], key_id, host, hello["name"], hello["caps"], own_id, identity["caps"], allow_drive,
                      hello["platform"])
+        link.accepts = accepts
+        return link
 
     def _hardware_towards(self, host, identity):
         """The `hw` for the welcome to `host`, as the initiator's hook does for its hello: the hook is
@@ -1272,7 +1281,7 @@ class LinkResponder:
         the ownership; `away()` is called under the lock, so it must be a plain read."""
         if focus["malformed"]:
             return "malformed", None
-        if not link.allow_drive:
+        if not link.allow_drive or not self._can_inject():
             return "not_allowed", None
         self._claiming = link
         try:
@@ -1384,7 +1393,9 @@ class LinkResponder:
     def peers_changed(self) -> None:
         """Brings the links in step with the peers list after the app changed it: a removed peer's
         links close at once, ending its ownership first; a peer whose `allow_drive` changed is sent
-        `accepts`, and turned off, loses its ownership with `refuse {why: "not_allowed"}`."""
+        `accepts`, and turned off, loses its ownership with `refuse {why: "not_allowed"}`. The same
+        when this machine stops or starts being able to play a peer's input (`_can_inject`), which
+        the app says by calling this."""
         with self._lock:
             self._generation += 1
         peers, _ = self._settings_now()
@@ -1394,6 +1405,7 @@ class LinkResponder:
             if found is not None:
                 by_key_id[found] = peer
         after = []
+        able = self._can_inject()
         with self._lock:
             for link in list(self._links.values()):
                 peer = by_key_id.get(link.key_id)
@@ -1407,12 +1419,13 @@ class LinkResponder:
                     link.close()
                     LOGGER.info("%s is not in use; its link is closed", link.name)
                     continue
-                allow_drive = peer.get("allow_drive") is True
-                if allow_drive != link.allow_drive:
-                    link.allow_drive = allow_drive
-                    if not allow_drive:
+                link.allow_drive = peer.get("allow_drive") is True
+                accepts = link.allow_drive and able
+                if accepts != link.accepts:
+                    link.accepts = accepts
+                    if not accepts:
                         after += self._end_locked(link, why="not_allowed")
-                    link.post(protocol.accepts_msg(allow_drive))
+                    link.post(protocol.accepts_msg(accepts))
         self._run(after)
         self._rearm_fresh()
 
@@ -1569,6 +1582,20 @@ class LinkResponder:
             self._sent_home_for_lock = self._send_home(link)
 
     # Plumbing
+
+    def _can_inject(self) -> bool:
+        """Whether this machine can play a peer's input at all. An injector says so with
+        `available()`, a plain read that never blocks (it is asked under the lock); one that does
+        not say, as Windows', the Mac's and X11's do not, always can. A Linux desktop with no way in
+        for another machine's keys says no, and then no peer is told it may drive this machine."""
+        available = getattr(self._injector_module(), "available", None)
+        if available is None:
+            return True
+        try:
+            return bool(available())
+        except Exception:
+            LOGGER.exception("Could not tell whether this machine can be driven")
+            return True
 
     def _injector_module(self):
         if self._injector is not None:

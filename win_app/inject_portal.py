@@ -739,6 +739,15 @@ def request_again() -> None:
     remote().request_again()
 
 
+def available() -> bool:
+    """Whether a peer's input can be played here: the receiver tells no peer it may drive a
+    machine that says no (core/receiver.py). A plain read. No once the desktop refused, or has no
+    portal for it, until Ask again; yes before the session is asked for and while it waits to
+    open again, when a peer's input is what opens it."""
+    session = _remote
+    return session is None or session._admits()
+
+
 def stop() -> None:
     if _remote is not None:
         _remote.stop()

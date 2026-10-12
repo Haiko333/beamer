@@ -289,6 +289,21 @@ class RemoteTest(unittest.TestCase):
         finally:
             inject_portal.RETRY_SECONDS = saved
 
+    def test_a_desktop_that_refused_is_not_available_to_be_driven_until_asked_again(self):
+        self.assertTrue(inject_portal.available())  # before the desktop is asked, and while it is
+        self.bus.answers["Start"] = (1, {})
+        self.remote.start()
+        wait_for(lambda: self.problems, what="the refusal")
+        wait_for(lambda: not inject_portal.available(), what="the injector saying it cannot be driven")
+        self.bus.answers["Start"] = (0, {"devices": 3, "clipboard_enabled": True, "restore_token": "new"})
+        self.bus.closed = False
+        self.remote.request_again()
+        self.assertTrue(inject_portal.available())
+
+    def test_a_session_that_is_up_is_available(self):
+        self.up()
+        self.assertTrue(inject_portal.available())
+
     def test_nothing_queues_once_the_desktop_has_refused(self):
         self.bus.answers["Start"] = (1, {})
         self.remote.start()

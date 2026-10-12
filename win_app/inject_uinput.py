@@ -222,6 +222,7 @@ _ready_at = 0.0
 _retry_at = 0.0
 _settled = False
 _stopped = False
+_retrying = False
 _problem: Optional[str] = None
 _layout: Optional[WaylandLayout] = None
 _names = None
@@ -393,6 +394,34 @@ def request_again() -> None:
     with _lock:
         _retry_at = 0.0
         _open()
+
+
+def available() -> bool:
+    """Whether a peer's input can be played here: the receiver tells no peer it may drive a
+    machine that says no (core/receiver.py). A plain read, asked under the receiver's lock. Yes
+    until the devices have been tried and could not be made; and since a machine no peer drives
+    gets no input that would have them tried again, asking is what tries, off this thread."""
+    global _retrying
+    if _devices is not None:
+        return True
+    if _stopped:
+        return False
+    if _problem is None:
+        return True
+    if time.monotonic() >= _retry_at and not _retrying:
+        _retrying = True
+        threading.Thread(target=_retry, name="Beamer-uinput-retry", daemon=True).start()
+    return False
+
+
+def _retry() -> None:
+    global _retrying
+    try:
+        with _lock:
+            if not _stopped:
+                _open()
+    finally:
+        _retrying = False
 
 
 @_locked

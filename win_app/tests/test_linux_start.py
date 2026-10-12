@@ -164,6 +164,9 @@ def evdev_child(config: Path) -> None:
             platform_parts.autostart.__name__] == ["inject_uinput", "clipboard_wl", "desktop_wlroots", "autostart_x11"]
     app = QApplication([])
     window = kvm_bridge_win.WindowsApplication(config)
+    told = []
+    changed = window.server.peers_changed
+    window.server.peers_changed = lambda: (told.append(True), changed())[1]
     window.start()
     assert window.windowTitle() == "Beamer"
     assert window._identity()["platform"] == "linux"
@@ -174,10 +177,16 @@ def evdev_child(config: Path) -> None:
     # The two rows that say whether this machine can drive and be driven are shown, and the
     # injector's row is wired: a machine that may not make its devices says so there.
     assert window.permission_state is not None and window.permissions_module is not None
-    inject_uinput.start()
+    inject_uinput.request_again()
     assert made, "the injector never tried to make its devices"
     status, detail = window.permission_state.status("remote")
     assert status == "unavailable" and "udev rule" in detail, (status, detail)
+    # No peer is told it may drive a machine that cannot play its input, and the peers are told
+    # when that changes.
+    assert platform_parts.injector.available() is False
+    assert window.server._can_inject() is False
+    app.processEvents()
+    assert told, "the receiver was not told that this machine can no longer be driven"
     # A peer's input with no devices is dropped, not raised into the link.
     platform_parts.injector.inject_key("a", True, "a")
     platform_parts.injector.inject_mouse_move(1, 1)

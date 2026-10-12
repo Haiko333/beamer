@@ -99,7 +99,7 @@ class Rig(unittest.TestCase):
         inject._said_at = 0.0
         inject._ready_at = inject._retry_at = 0.0
         inject._settled = False
-        inject._stopped = False
+        inject._stopped = inject._retrying = False
         inject._state = inject.KeyState()
         inject._pressed.clear()
         inject._buttons_down.clear()
@@ -309,6 +309,7 @@ class LifeTest(Rig):
         inject.start()
         inject.inject_key("enter", True)
         self.assertEqual((self.made, self.rows, self.said), (1, [("ready", "", False)], []))
+        self.assertTrue(inject.available())
 
     def test_release_all_lets_go_of_everything_held(self):
         inject.inject_key("ctrl", True)
@@ -330,6 +331,7 @@ class LifeTest(Rig):
         self.assertTrue(self.devices.closed)
         inject.inject_key("enter", True)
         self.assertEqual(self.made, 1)
+        self.assertFalse(inject.available())
 
     def test_devices_the_kernel_took_away_are_made_again_later_not_at_every_event(self):
         inject.start()
@@ -388,6 +390,29 @@ class NoDevicesTest(Rig):
                 inject.inject_scroll(1)
                 inject.release_all()
                 self.assertEqual((self.said, self.rows, self.made), ([sentence], [("unavailable", sentence, True)], 1))
+
+    def test_a_machine_that_could_not_make_its_devices_is_not_available_to_be_driven(self):
+        self.assertTrue(inject.available())  # not tried yet
+        self.fail_with(PermissionError(13, "Permission denied"))
+        with self.assertLogs(inject.LOGGER, "WARNING"):
+            inject.start()
+        self.assertFalse(inject.available())
+        self.assertEqual(self.made, 1)  # asked again at once: not tried again so soon
+
+    def test_asking_is_what_has_the_devices_tried_again_and_the_app_told_when_they_are_made(self):
+        self.fail_with(PermissionError(13, "Permission denied"))
+        with self.assertLogs(inject.LOGGER, "WARNING"):
+            inject.start()
+        # The udev rule is installed meanwhile.
+        mock.patch.object(inject, "_connect", lambda: self.devices).start()
+        self.addCleanup(mock.patch.stopall)
+        inject._retry_at = 0.0
+        self.assertFalse(inject.available())  # the answer now; the try is off this thread
+        deadline = inject.time.monotonic() + 2
+        while not inject.available() and inject.time.monotonic() < deadline:
+            inject.time.sleep(0.005)
+        self.assertTrue(inject.available())
+        self.assertEqual(self.rows[-1], ("ready", "", False))
 
     def test_ask_again_tries_at_once(self):
         self.fail_with(PermissionError(13, "Permission denied"))
