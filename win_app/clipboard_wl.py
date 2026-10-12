@@ -6,7 +6,7 @@ the compositor's data-control protocol, which Hyprland, sway, the other wlroots 
 KDE have and GNOME does not. wl-copy and wl-paste speak it, so Beamer runs them rather than carry
 a Wayland client of its own:
 
-- `wl-paste --watch` runs for as long as Beamer does and prints a line at each change of the
+- `wl-paste --watch` runs for as long as Beamer does and has a line printed at each change of the
   clipboard, which is all `change_stamp` needs;
 - `wl-paste` reads what another app copied, text and a picture (a PNG as it is, another kind
   turned into one);
@@ -23,8 +23,9 @@ reader calls set_contents and must not stall on a tool that hangs."""
 
 import atexit
 import logging
+import os
+import select
 import shutil
-import signal
 import subprocess
 import threading
 import time
@@ -41,6 +42,9 @@ TIMEOUT_SECONDS = 2.0
 # acknowledgement (core/link.py ACK_STALL_SECONDS).
 SET_SECONDS = 0.5
 MAX_BYTES = 64 * 1024 * 1024
+LIST_BYTES = 64 * 1024
+# What password managers put beside a secret they copy, for clipboard tools to leave it alone.
+SECRET_HINT = "x-kde-passwordManagerHint"
 # The watcher tells of Beamer's own copy as of any other; one that arrives this soon after is that.
 ECHO_SECONDS = 2.0
 # A watcher that ends is started again after this long, and given up on when it keeps ending at once.
@@ -69,40 +73,68 @@ def _say_once(key: str, message: str, *args) -> None:
 
 def _tool(name: str) -> Optional[str]:
     path = shutil.which(name)
-    if path is None:
+    # A PATH with "." or an empty entry in it would name whatever sits in the current directory.
+    if path is None or not os.path.isabs(path):
         _say_once(name, "%s is not installed (the wl-clipboard package), so the clipboard is not shared", name)
+        return None
     return path
 
 
-def _run(arguments: List[str], data: Optional[bytes] = None, timeout: float = TIMEOUT_SECONDS) -> Tuple[int, bytes]:
-    """Run a tool to its end within `timeout`: (exit code, what it printed). wl-copy leaves a child
-    behind to hold the clipboard, so nothing it inherits may be a pipe this waits on."""
-    capture = data is None
-    process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL if capture else subprocess.PIPE,
-                               stdout=subprocess.PIPE if capture else subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+class TooLarge(Exception):
+    """A tool printed more than Beamer takes."""
+
+
+def _run(arguments: List[str], data: Optional[bytes] = None, timeout: float = TIMEOUT_SECONDS,
+         limit: int = MAX_BYTES) -> Tuple[int, bytes]:
+    """Run a tool to its end within `timeout`: (exit code, what it printed, up to `limit` bytes).
+    wl-copy leaves a child behind to hold the clipboard, so nothing it inherits may be a pipe this
+    waits on: with `data` to feed it, nothing it prints is read."""
+    if data is not None:
+        process = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            process.communicate(data, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
+        return process.returncode, b""
+    process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    chunks, size, deadline = [], 0, time.monotonic() + timeout
     try:
-        out, _ = process.communicate(data, timeout=timeout)
-    except subprocess.TimeoutExpired:
+        # Read as it comes, so an app offering a clipboard without end costs `limit`, not memory.
+        fd = process.stdout.fileno()
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise subprocess.TimeoutExpired(arguments, timeout)
+            if not select.select([fd], [], [], left)[0]:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit:
+                raise TooLarge()
+            chunks.append(chunk)
+        process.wait(timeout=max(deadline - time.monotonic(), 0.05))
+    except BaseException:
         process.kill()
-        process.communicate()
+        process.wait()
         raise
-    return process.returncode, out or b""
+    finally:
+        process.stdout.close()
+    return process.returncode, b"".join(chunks)
 
 
-def _die_with_parent() -> None:
-    """In the watcher's child, before it becomes wl-paste: a Beamer that is killed takes it along."""
-    try:
-        import ctypes
-
-        ctypes.CDLL(None).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
-    except Exception:
-        pass
+# What wl-paste runs at each change. It gets the clipboard on its stdin and never reads it: a line
+# on Beamer's pipe is all that is asked. When that pipe is gone, because Beamer was killed and
+# could not end its watcher, the line cannot be written and the watcher is ended from here.
+WATCH_COMMAND = ("/bin/sh", "-c", 'trap "" PIPE; echo 2>/dev/null || kill "$PPID"')
 
 
 def _spawn_watcher(path: str):
-    # `echo` gets the clipboard on its stdin and never reads it: a line per change is all that is asked.
-    return subprocess.Popen([path, "--watch", "echo"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, preexec_fn=_die_with_parent)
+    return subprocess.Popen([path, "--watch", *WATCH_COMMAND], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
 
 
 def _changed() -> None:
@@ -134,8 +166,15 @@ def _watch(path: str) -> None:
         if _stopping.is_set():
             # stop() came between the look at the flag and the start: it found no process to end.
             process.terminate()
-        for _line in process.stdout:
-            _changed()
+        try:
+            # wl-paste tells of the clipboard as it finds it when it starts, which is no change.
+            first = True
+            for _line in process.stdout:
+                if not first:
+                    _changed()
+                first = False
+        finally:
+            process.stdout.close()
         process.wait()
         if _stopping.is_set():
             break
@@ -210,13 +249,12 @@ def _to_png(data: bytes) -> Optional[bytes]:
 
 
 def _paste(path: str, mime: str) -> Optional[bytes]:
-    code, out = _run([path, "--no-newline", "--type", mime])
-    if code != 0 or not out:
-        return None
-    if len(out) > MAX_BYTES:
+    try:
+        code, out = _run([path, "--no-newline", "--type", mime])
+    except TooLarge:
         LOGGER.warning("The clipboard is larger than Beamer sends; leaving it")
         return None
-    return out
+    return out if code == 0 and out else None
 
 
 def get_contents() -> Tuple[Optional[str], Optional[bytes]]:
@@ -230,10 +268,12 @@ def get_contents() -> Tuple[Optional[str], Optional[bytes]]:
     if path is None:
         return None, None
     try:
-        code, listed = _run([path, "--list-types"])
+        code, listed = _run([path, "--list-types"], limit=LIST_BYTES)
         if code != 0:
             return None, None  # nothing is copied
         offered = listed.decode("utf-8", "replace").split()
+        if SECRET_HINT in offered and _paste(path, SECRET_HINT) == b"secret":
+            return None, None  # a password manager's copy stays on this machine
         text = png = None
         mime = next((m for m in TEXT_MIMES if m in offered), None)
         if mime is not None:
@@ -250,6 +290,8 @@ def get_contents() -> Tuple[Optional[str], Optional[bytes]]:
         return text or None, png
     except subprocess.TimeoutExpired:
         LOGGER.warning("The app holding the clipboard did not hand it over in time")
+        return None, None
+    except TooLarge:
         return None, None
     except Exception:
         LOGGER.exception("Could not read the clipboard")
@@ -281,8 +323,11 @@ def set_contents(text: Optional[str], png: Optional[bytes]) -> bool:
     try:
         code, _ = _run([path, "--type", mime], data, timeout=SET_SECONDS)
     except subprocess.TimeoutExpired:
+        # It may have taken the clipboard before it was stopped: the watcher's word of that is
+        # still awaited, and the clipboard still counts as Beamer's own, so what a peer sent is
+        # never read back as this machine's and sent to it again.
         LOGGER.warning("wl-copy did not take the clipboard in time")
-        code = -1
+        return False
     except Exception:
         LOGGER.exception("Could not set the clipboard")
         code = -1

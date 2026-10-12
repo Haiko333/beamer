@@ -71,7 +71,7 @@ class PortalProbeTests(unittest.TestCase):
             self.assertEqual(linux_desktop.portals(), frozenset({"InputCapture", "Clipboard"}))
         self.assertEqual(closed, [True])
 
-    def test_a_portal_that_stops_answering_keeps_what_it_answered(self):
+    def test_a_portal_that_does_not_answer_in_time_is_unknown_not_absent(self):
         jeepney = SimpleNamespace(
             DBusAddress=lambda path, bus, interface: None,
             MessageType=SimpleNamespace(error="error"),
@@ -90,7 +90,7 @@ class PortalProbeTests(unittest.TestCase):
         blocking = SimpleNamespace(open_dbus_connection=lambda bus: Connection())
         with mock.patch.dict(sys.modules, {"jeepney": jeepney, "jeepney.io": SimpleNamespace(blocking=blocking),
                                            "jeepney.io.blocking": blocking}):
-            self.assertEqual(linux_desktop.portals(), frozenset({"InputCapture"}))
+            self.assertIsNone(linux_desktop.portals())
 
 
 class CrossingGuidanceTests(unittest.TestCase):

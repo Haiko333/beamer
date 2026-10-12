@@ -52,6 +52,7 @@ PRODUCTS = {KEYBOARD_NAME: 1, POINTER_NAME: 2, ABSOLUTE_NAME: 3}
 # evdev: the keys a keyboard may have. 0x100 to 0x15f are buttons (mice, joysticks, gamepads), and
 # a keyboard that claimed them would be taken for one of those.
 KEY_CODES = tuple(range(1, 0x100)) + tuple(range(0x160, 0x300))
+KEY_SYSRQ, ALT_CODES = 99, frozenset({56, 100})
 BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112, "back": 0x113, "forward": 0x114}
 EV_SYN, EV_KEY, EV_REL, EV_ABS, EV_LED = 0, 1, 2, 3, 0x11
 REL_X, REL_Y, REL_HWHEEL, REL_WHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES = 0, 1, 6, 8, 11, 12
@@ -62,14 +63,16 @@ HI_RES_PER_CLICK = 120
 PIXELS_PER_CLICK = 40.0
 # How long the compositor gets to adopt the devices before the first event is played.
 SETTLE_SECONDS = 0.3
+# How long what the compositor said of the keyboard layout is gone by.
+LAYOUT_SECONDS = 1.0
 # After the devices could not be made, or stopped taking events, they are made again no sooner.
 RETRY_SECONDS = 5.0
 
 NO_EVDEV = ("Beamer cannot control this machine: python-evdev is not installed, so another machine cannot "
             "drive this one.")
 NO_ACCESS = ("Beamer may not create a keyboard and mouse on this machine, so another machine cannot drive this "
-             "one: /dev/uinput is not open to this user. Install Beamer's udev rule (see the README), then sign "
-             "out and in again.")
+             "one: /dev/uinput is not open to this user. Install Beamer's udev rule (packaging/linux in Beamer's "
+             "source, described in the README), then choose Ask again.")
 NO_UINPUT = ("Beamer cannot control this machine: /dev/uinput is missing. Load the kernel's uinput module "
              "(sudo modprobe uinput), then choose Ask again.")
 FAILED = "Beamer cannot control this machine: {detail}"
@@ -128,6 +131,16 @@ class _Devices:
     def __init__(self, absolute: bool) -> None:
         from evdev import AbsInfo, UInput
 
+        class Plain(UInput):
+            """python-evdev opens the new device's own /dev/input node as well, to offer it for
+            reading: that waits two seconds for a node this user may not open, then fails with the
+            device already made and never closed. Nothing here reads that node (the LEDs come back
+            on the uinput fd), so it is not looked for."""
+
+            def _find_device(self, fd):
+                return None
+
+        UInput = Plain
         self._made = []
         try:
             self.keyboard = self._make(UInput, KEYBOARD_NAME, {
@@ -212,6 +225,8 @@ _stopped = False
 _problem: Optional[str] = None
 _layout: Optional[WaylandLayout] = None
 _names = None
+_said: Optional[dict] = None
+_said_at = 0.0
 _state = KeyState()
 _pressed: Set[int] = set()
 _buttons_down: Set[str] = set()
@@ -272,13 +287,32 @@ def _open():
 def _drop() -> None:
     """After a failed write the devices are closed and made again on a later event: a device the
     kernel took away never comes back."""
-    global _devices, _layout, _retry_at
-    dead, _devices, _layout = _devices, None, None
+    global _devices, _retry_at
+    dead, _devices = _devices, None
     _retry_at = time.monotonic() + RETRY_SECONDS
     desktop_wlroots.set_mover(None)
-    _pressed.clear()
+    _forget_layout()
+    # Nothing is held on a device that is gone, and the planner must not think otherwise: it
+    # would swallow the peer's repeats of a key the next device never got.
+    _forget_held()
     if dead is not None:
         dead.close()
+
+
+def _forget_layout() -> None:
+    global _layout, _names, _said_at
+    if _layout is not None:
+        _layout.keymap.close()
+    _layout, _names, _said_at = None, None, 0.0
+
+
+def _forget_held() -> None:
+    _pressed.clear()
+    _buttons_down.clear()
+    _state.mods_down.clear()
+    _state.named_down.clear()
+    _state.chars_down.clear()
+    _wheel_carry[:] = [0.0, 0.0, 0.0, 0.0]
 
 
 def _play(function) -> None:
@@ -304,27 +338,39 @@ def _play(function) -> None:
             _report("unavailable", FAILED.format(detail=exc), retryable=True)
 
 
-def _current_layout(said: Optional[dict]) -> Optional[WaylandLayout]:
-    """The layout to type in: compiled again when the compositor names another one."""
-    global _layout, _names
-    wanted = next(linux_layout.sources(said=said))[1]
-    if _layout is None or wanted != _names:
-        try:
-            keymap, _used, origin = _keymap(said=said)
-        except Exception as exc:
-            _warn_once("Characters cannot be typed: %s", str(exc))
-            return None
-        if _layout is not None:
-            _layout.keymap.close()
-        _layout, _names = WaylandLayout(keymap), wanted
-        LOGGER.info("Typing in the keyboard layout %s, from %s", wanted.layout or "(default)", origin)
-    return _layout
+def _typing() -> Tuple[Optional[WaylandLayout], int]:
+    """(the layout to type in, its group typing now). The compositor is asked which at most once
+    in LAYOUT_SECONDS, not at every character, and the layout is compiled again only when it names
+    another one; one that cannot be compiled is not tried again until then either."""
+    global _layout, _names, _said, _said_at
+    now = time.monotonic()
+    if now - _said_at >= LAYOUT_SECONDS or _said_at == 0.0:
+        _said, _said_at = desktop_wlroots.keyboard(KEYBOARD_NAME), now
+        wanted = next(linux_layout.sources(said=_said))[1]
+        if wanted != _names:
+            if _layout is not None:
+                _layout.keymap.close()
+            _layout, _names = None, wanted
+            try:
+                keymap, _used, origin = _keymap(said=_said)
+            except Exception as exc:
+                _warn_once("Characters cannot be typed: %s", str(exc))
+            else:
+                _layout = WaylandLayout(keymap)
+                LOGGER.info("Typing in the keyboard layout %s, from %s", wanted.layout or "(default)", origin)
+    return _layout, (_said or {}).get("group", 0)
 
 
 def _press(devices, steps: List[Tuple[int, bool]]) -> None:
     for code, down in steps:
         if code not in _KEY_SET:
             _warn_once("No key on the virtual keyboard for evdev code %s", str(code))
+            continue
+        if code == KEY_SYSRQ and down and _pressed & ALT_CODES:
+            # Alt with Print Screen is the kernel's own SysRq chord, which reads uinput's keys as
+            # it reads a real keyboard's: the key after it could sync, reboot or power off this
+            # machine from under a locked screen. No peer gets to press it.
+            _warn_once("Alt+Print Screen is not pressed for a peer (%s): it is the kernel's SysRq", "print_screen")
             continue
         devices.key(code, down)
         (_pressed.add if down else _pressed.discard)(code)
@@ -352,16 +398,14 @@ def request_again() -> None:
 @_locked
 def stop() -> None:
     """For good: every key is let go and the devices are removed."""
-    global _devices, _layout, _stopped
+    global _devices, _stopped
     release_all()
     _stopped = True
     desktop_wlroots.set_mover(None)
     dead, _devices = _devices, None
     if dead is not None:
         dead.close()
-    if _layout is not None:
-        _layout.keymap.close()
-        _layout = None
+    _forget_layout()
 
 
 @_locked
@@ -369,11 +413,10 @@ def inject_key(name: str, down: bool, us: Optional[str] = None) -> None:
     def go(devices):
         group, locks, layout = 0, 0, _layout
         if len(name) == 1:
-            said = desktop_wlroots.keyboard(KEYBOARD_NAME)
-            layout = _current_layout(said)
+            layout, group = _typing()
             if layout is None:
                 return
-            group, locks = (said or {}).get("group", 0), devices.locks()
+            locks = devices.locks()
         steps = plan_key(name, down, us, _state, layout, group, locks)
         if steps:
             _press(devices, wayland_steps(steps))
@@ -384,11 +427,10 @@ def inject_key(name: str, down: bool, us: Optional[str] = None) -> None:
 @_locked
 def inject_text(text: str) -> None:
     def go(devices):
-        said = desktop_wlroots.keyboard(KEYBOARD_NAME)
-        layout = _current_layout(said)
+        layout, group = _typing()
         if layout is None:
             return
-        steps = plan_text(text, _state, layout, (said or {}).get("group", 0), devices.locks())
+        steps = plan_text(text, _state, layout, group, devices.locks())
         if steps:
             _press(devices, wayland_steps(steps))
 
@@ -454,9 +496,4 @@ def release_all() -> None:
 
     if _devices is not None and (codes or buttons):
         _play(go)
-    _pressed.clear()
-    _buttons_down.clear()
-    _state.mods_down.clear()
-    _state.named_down.clear()
-    _state.chars_down.clear()
-    _wheel_carry[:] = [0.0, 0.0, 0.0, 0.0]
+    _forget_held()

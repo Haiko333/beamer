@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Optional
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,10 +36,11 @@ def desktop(environ=None) -> str:
     return ""
 
 
-def portals(timeout: float = PROBE_SECONDS) -> frozenset:
+def portals(timeout: float = PROBE_SECONDS) -> Optional[frozenset]:
     """The desktop portals this session has, of PORTAL_INTERFACES, by their short names. Empty when
-    the portal cannot be reached at all (no session bus, no jeepney, no portal service): a missing
-    portal is an answer here, never an error."""
+    there is no portal to reach (no session bus, no jeepney, no portal service): a missing portal
+    is an answer here, never an error. None when the portal is there but did not answer in time,
+    as one still starting at sign-in may not: that says nothing of what it has."""
     try:
         from jeepney import DBusAddress, MessageType, new_method_call
         from jeepney.io.blocking import open_dbus_connection
@@ -55,9 +57,12 @@ def portals(timeout: float = PROBE_SECONDS) -> frozenset:
             reply = connection.send_and_get_reply(message, timeout=timeout)
             if reply.header.message_type != MessageType.error:
                 found.add(name)
+    except TimeoutError as exc:
+        LOGGER.info("The desktop portal did not answer in time: %s", exc)
+        return None
     except Exception as exc:
-        # A portal that stopped answering part way: what it did answer for stands.
-        LOGGER.info("The desktop portal did not answer: %s", exc)
+        # A bus that failed part way: what the portal did answer for stands.
+        LOGGER.info("The desktop portal could not be asked: %s", exc)
     finally:
         try:
             connection.close()

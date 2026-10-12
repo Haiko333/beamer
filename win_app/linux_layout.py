@@ -99,16 +99,36 @@ def from_system(paths=SYSTEM_FILES) -> Optional[Names]:
     return None
 
 
+_NAME = re.compile(r"[A-Za-z0-9_.,:+()-]*")
+_warned = set()
+
+
+def _sound(names: Names) -> bool:
+    """Whether every name is one XKB could have: they are handed to libxkbcommon, which reads a
+    name as part of a file's path."""
+    return all(_NAME.fullmatch(value) for value in names)
+
+
 def sources(environ=None, said: Optional[dict] = None, known=descriptions, system=from_system):
-    """Every (where from, Names) there is, best first. `said` is what the compositor says
-    (desktop_wlroots.keyboard)."""
+    """Every (where from, Names) there is, best first, leaving out any with a name XKB could not
+    have. `said` is what the compositor says (desktop_wlroots.keyboard)."""
+    for origin, names in _sources(environ, said, known, system):
+        if _sound(names):
+            yield origin, names
+        elif origin not in _warned:
+            _warned.add(origin)
+            LOGGER.warning("The keyboard layout from %s is not a name XKB has; passing over it", origin)
+
+
+def _sources(environ, said, known, system):
     environ = os.environ if environ is None else environ
     override = environ.get("BEAMER_XKB_LAYOUT", "").strip()
     if override:
         parsed = parse_override(override)
         if parsed is not None:
             yield "BEAMER_XKB_LAYOUT", parsed
-        else:
+        elif override not in _warned:
+            _warned.add(override)
             LOGGER.warning("BEAMER_XKB_LAYOUT=%r is not a layout as XKB writes one, like fr or fr(bepo)", override)
     if said:
         if said.get("layout"):

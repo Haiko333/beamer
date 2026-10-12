@@ -1,7 +1,7 @@
 """clipboard_wl with wl-copy and wl-paste faked: what is read and set, how Beamer's own copy is told
 from another app's, and that a desktop without the tools, or one that refuses them, costs nothing."""
 
-import io
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -25,6 +25,7 @@ class FakeWatcher:
         self.stdout = open(self._read, "rb", buffering=0)
         self.returncode = None
         self.terminated = False
+        self.changed()  # as the real one does when it starts, for the clipboard as it finds it
 
     def changed(self):
         __import__("os").write(self._write, b"\n")
@@ -52,7 +53,7 @@ class Rig(unittest.TestCase):
         self.watchers = []
         self.tools = {"wl-copy": "/usr/bin/wl-copy", "wl-paste": "/usr/bin/wl-paste"}
 
-        def run(arguments, data=None, timeout=clipboard.TIMEOUT_SECONDS):
+        def run(arguments, data=None, timeout=clipboard.TIMEOUT_SECONDS, limit=clipboard.MAX_BYTES):
             if self.hang:
                 raise subprocess.TimeoutExpired(arguments, timeout)
             if arguments[0].endswith("wl-copy"):
@@ -62,6 +63,8 @@ class Rig(unittest.TestCase):
             if "--list-types" in arguments:
                 return (0, "\n".join(self.selection).encode()) if self.selection else (1, b"")
             mime = arguments[arguments.index("--type") + 1]
+            if len(self.selection.get(mime, b"")) > limit:
+                raise clipboard.TooLarge()
             return (0, self.selection[mime]) if mime in self.selection else (1, b"")
 
         def spawn(path):
@@ -122,9 +125,15 @@ class ReadTest(Rig):
 
     def test_an_empty_clipboard_and_one_too_large_read_as_nothing(self):
         self.assertEqual(clipboard.get_contents(), (None, None))
-        self.selection = {"text/plain": b"x" * 10}
-        with mock.patch.object(clipboard, "MAX_BYTES", 5), self.assertLogs(clipboard.LOGGER, "WARNING"):
+        self.selection = {"text/plain": b"x" * (clipboard.MAX_BYTES + 1)}
+        with self.assertLogs(clipboard.LOGGER, "WARNING"):
             self.assertEqual(clipboard.get_contents(), (None, None))
+
+    def test_a_password_managers_copy_is_not_read(self):
+        self.selection = {"text/plain": b"hunter2", "x-kde-passwordManagerHint": b"secret"}
+        self.assertEqual(clipboard.get_contents(), (None, None))
+        self.selection["x-kde-passwordManagerHint"] = b"public"
+        self.assertEqual(clipboard.get_contents(), ("hunter2", None))
 
     def test_an_app_that_never_hands_its_copy_over_is_waited_for_no_longer_than_the_timeout(self):
         self.hang = True
@@ -155,13 +164,35 @@ class WriteTest(Rig):
         self.selection = {"text/plain": b"theirs"}
         self.assertEqual(clipboard.get_contents(), ("theirs", None))
 
-    def test_a_wl_copy_that_hangs_is_given_up_on(self):
+    def test_a_wl_copy_that_hangs_is_given_up_on_and_what_it_may_have_set_is_not_read_back(self):
         self.hang = True
         with self.assertLogs(clipboard.LOGGER, "WARNING"):
-            self.assertFalse(clipboard.set_contents("a", None))
+            self.assertFalse(clipboard.set_contents("from a peer", None))
+        # It was stopped, but had it taken the clipboard first, that text is the peer's own.
+        self.hang = False
+        self.selection = {"text/plain": b"from a peer"}
+        self.assertEqual(clipboard.get_contents(), (None, None))
 
 
 class StampTest(Rig):
+    def test_the_watchers_first_word_as_it_starts_is_not_a_change(self):
+        first = clipboard.change_stamp()
+        self.until(lambda: self.watchers)
+        self.watchers[-1].changed()
+        self.until(lambda: clipboard.change_stamp() != first)
+        self.assertEqual(clipboard.change_stamp(), first + 1)  # one for the copy, none for the start
+
+    def test_a_peers_copy_set_while_the_watcher_is_still_starting_is_not_taken_for_another_apps(self):
+        clipboard.change_stamp()
+        self.assertTrue(clipboard.set_contents("from a peer", None))
+        after = clipboard.change_stamp()
+        self.until(lambda: self.watchers)
+        self.watchers[-1].changed()  # the watcher telling of that copy, after its starting word
+        self.until(lambda: not clipboard._echoes)
+        self.assertEqual(clipboard.change_stamp(), after)
+        self.selection = {"text/plain": b"from a peer"}
+        self.assertEqual(clipboard.get_contents(), (None, None))
+
     def test_another_apps_copy_moves_the_stamp(self):
         first = clipboard.change_stamp()
         self.another_app_copies(**{"text/plain": b"one"})
@@ -238,9 +269,31 @@ class ToolTest(unittest.TestCase):
             self.assertIsNone(clipboard._tool("wl-copy"))
         self.assertEqual(len(logged.records), 1)
         clipboard._said.clear()
+        # One found through a relative PATH entry is whatever sits in the current directory.
+        with mock.patch.object(clipboard.shutil, "which", lambda name: "./wl-paste"), self.assertLogs(clipboard.LOGGER, "WARNING"):
+            self.assertIsNone(clipboard._tool("wl-paste"))
+        clipboard._said.clear()
+
+    def test_the_watchers_command_prints_a_line_and_ends_its_parent_when_nobody_listens(self):
+        done = subprocess.run(list(clipboard.WATCH_COMMAND), capture_output=True, timeout=5)
+        self.assertEqual((done.returncode, done.stdout), (0, b"\n"))
+        # With the pipe gone, the parent is ended: here a shell that only waits for that.
+        parent = subprocess.Popen(["/bin/sh", "-c", 'sleep 30'])
+        try:
+            command = clipboard.WATCH_COMMAND[2].replace('"$PPID"', str(parent.pid))
+            read, write = os.pipe()
+            os.close(read)
+            subprocess.run(["/bin/sh", "-c", command], stdout=write, timeout=5)
+            os.close(write)
+            self.assertEqual(parent.wait(timeout=5), -15)
+        finally:
+            if parent.poll() is None:
+                parent.kill()
 
     def test_a_real_tool_is_run_to_its_end_and_a_slow_one_is_killed(self):
         self.assertEqual(clipboard._run(["/bin/sh", "-c", "printf abc"]), (0, b"abc"))
+        with self.assertRaises(clipboard.TooLarge):
+            clipboard._run(["/bin/sh", "-c", "yes"], limit=100000)
         self.assertEqual(clipboard._run(["/bin/sh", "-c", "cat >/dev/null; exit 3"], b"in"), (3, b""))
         started = time.monotonic()
         with self.assertRaises(subprocess.TimeoutExpired):

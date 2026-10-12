@@ -149,7 +149,38 @@ class DesktopTest(unittest.TestCase):
                 desktop.set_cursor_position(10, 20)
                 self.assertEqual(desktop.cursor_position(), (10, 20))
                 self.assertIsNone(desktop.full_screen_app())
-        self.assertEqual(len(logged.records), 4)
+        # Only what was asked before the compositor was left alone is reported, and once.
+        self.assertEqual(len(logged.records), 1)
+
+    def test_a_compositor_that_failed_is_left_alone_for_a_while_then_asked_again(self):
+        desktop.cursor_position()
+        self.ipc.broken = {"cursor"}
+        self.ipc.asked.clear()
+        with self.assertLogs(desktop.LOGGER, "WARNING"):
+            for _ in range(50):
+                desktop.cursor_position()
+                desktop.set_cursor_position(10, 20)
+                desktop.full_screen_app()
+        # One failure, then nothing: not a quarter second of the link's thread at every move.
+        self.assertEqual(self.ipc.asked, ["cursor"])
+        self.assertEqual(self.ipc.moves, [])
+        self.ipc.broken = set()
+        self.ipc.pointer = (7, 8)
+        with mock.patch.object(desktop.time, "monotonic", return_value=desktop.time.monotonic() + desktop.QUIET_SECONDS + 1):
+            self.assertEqual(desktop.cursor_position(), (7, 8))
+
+    def test_a_display_coming_or_going_has_the_compositor_asked_afresh(self):
+        self.assertEqual(desktop.display_map(), {"0": LAPTOP, "1": TURNED})
+        self.ipc.displays = [LAPTOP]
+        self.assertEqual(len(desktop.monitors()), 2)  # still within the second
+        from PySide6.QtWidgets import QApplication
+        import os
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        QApplication.instance() or QApplication([])
+        self.addCleanup(setattr, desktop, "_screens", [])
+        desktop.refresh_qt_screens()
+        self.assertEqual(desktop.display_map(), {"0": LAPTOP})
 
     def test_without_a_pointer_answer_the_notes_are_the_position(self):
         self.ipc = FakeIpc(tells_cursor=False)
@@ -308,6 +339,25 @@ class SocketTest(unittest.TestCase):
                    "xkb_active_layout_index": 1}]
         self.assertEqual(desktop.sway_keyboard(inputs), {"descriptions": ["French (AZERTY)", "English (US)"], "group": 1})
         self.assertIsNone(desktop.sway_keyboard([{"type": "pointer"}]))
+
+    def test_an_answer_without_end_is_cut_off(self):
+        def endless(link):
+            link.recv(4096)
+            try:
+                while True:
+                    link.sendall(b"x" * 65536)
+            except OSError:
+                pass
+
+        with mock.patch.object(desktop, "MAX_REPLY_BYTES", 200000), self.assertRaises(OSError):
+            desktop.Hyprland(self.serve(endless)).request("j/monitors")
+
+        def huge(link):
+            link.recv(4096)
+            link.sendall(b"i3-ipc" + struct.pack("<II", 0x7FFFFFFF, 3))
+
+        with self.assertRaises(OSError):
+            desktop.Sway(self.serve(huge)).monitors()
 
     def test_a_socket_that_is_not_there_is_an_error_for_the_caller_to_absorb(self):
         with self.assertRaises(OSError):

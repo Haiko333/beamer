@@ -1,0 +1,11 @@
+# Beamer: let the person signed in at this seat create a virtual keyboard and mouse, which is how
+# another machine drives this one on a Wayland desktop with no RemoteDesktop portal (Hyprland, sway
+# and the other wlroots compositors).
+#
+# Install:
+#   sudo install -m 644 70-beamer-uinput.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput
+#
+# What this allows: every program this person runs, not Beamer alone, can then type and click as
+# they do. The number must stay below 73, where systemd applies the uaccess tag.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

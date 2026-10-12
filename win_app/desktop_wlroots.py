@@ -39,6 +39,11 @@ LOGGER = logging.getLogger(__name__)
 IPC_SECONDS = 0.25
 # The displays are asked on every move a peer sends, and change when a cable does.
 MONITORS_SECONDS = 1.0
+# After the compositor failed to answer it is left alone this long, and the notes stand in: asked
+# again at every move, one that is stuck would hold the link's thread a quarter second at a time.
+QUIET_SECONDS = 3.0
+# No answer is longer than this (a tree of a few hundred windows is a fraction of it).
+MAX_REPLY_BYTES = 4 * 1024 * 1024
 
 
 def hyprland_monitors(reply: list) -> List[Rect]:
@@ -147,11 +152,14 @@ class Hyprland:
             link.settimeout(IPC_SECONDS)
             link.connect(self.path)
             link.sendall(command.encode("utf-8"))
-            chunks = []
+            chunks, size, deadline = [], 0, time.monotonic() + IPC_SECONDS
             while True:
                 chunk = link.recv(8192)
                 if not chunk:
                     break
+                size += len(chunk)
+                if size > MAX_REPLY_BYTES or time.monotonic() > deadline:
+                    raise OSError("Hyprland's answer did not end")
                 chunks.append(chunk)
         return b"".join(chunks).decode("utf-8", "replace")
 
@@ -215,17 +223,22 @@ class Sway:
             if not header.startswith(self.MAGIC):
                 raise OSError("sway answered with something that is not i3 IPC")
             length, _kind = struct.unpack("<II", header[len(self.MAGIC):])
+            if length > MAX_REPLY_BYTES:
+                raise OSError("sway's answer is longer than any it gives")
             return json.loads(self._read(link, length).decode("utf-8", "replace"))
 
     @staticmethod
     def _read(link, count: int) -> bytes:
-        data = b""
-        while len(data) < count:
-            chunk = link.recv(count - len(data))
+        chunks, left, deadline = [], count, time.monotonic() + IPC_SECONDS
+        while left:
+            chunk = link.recv(min(left, 65536))
             if not chunk:
                 raise OSError("sway closed its socket mid-answer")
-            data += chunk
-        return data
+            if time.monotonic() > deadline:
+                raise OSError("sway's answer did not end")
+            chunks.append(chunk)
+            left -= len(chunk)
+        return b"".join(chunks)
 
     def monitors(self) -> List[Rect]:
         return sway_monitors(self.request(self.GET_OUTPUTS))
@@ -264,16 +277,17 @@ _position: Optional[Tuple[float, float]] = None
 _mover: Optional[Callable[[int, int], None]] = None
 _screens: List[Rect] = []
 _monitors: Tuple[float, List[Rect]] = (0.0, [])
+_quiet_until = 0.0
 _said = set()
 
 
 def use(ipc) -> None:
     """Set the compositor socket (a test's fake, or None for a desktop with none) and forget what
     the last one said."""
-    global _ipc, _ipc_sought, _position, _monitors
+    global _ipc, _ipc_sought, _position, _monitors, _quiet_until
     with _lock:
         _ipc, _ipc_sought = ipc, True
-        _position, _monitors = None, (0.0, [])
+        _position, _monitors, _quiet_until = None, (0.0, []), 0.0
         _said.clear()
 
 
@@ -307,6 +321,29 @@ def _failed(what: str, exc: BaseException) -> None:
     LOGGER.warning("The compositor did not %s (%s); Beamer goes by its own notes", what, exc)
 
 
+class _Quiet(Exception):
+    """The compositor is being left alone after a failure."""
+
+
+def _ask(what: str, call, default=None):
+    """`call(ipc)`, or `default` when there is no socket, it fails, or it failed too recently to
+    be asked again."""
+    global _quiet_until
+    ipc = _found()
+    if ipc is None:
+        return default
+    with _lock:
+        if time.monotonic() < _quiet_until:
+            return default
+    try:
+        return call(ipc)
+    except Exception as exc:
+        with _lock:
+            _quiet_until = time.monotonic() + QUIET_SECONDS
+        _failed(what, exc)
+        return default
+
+
 def set_mover(mover: Optional[Callable[[int, int], None]]) -> None:
     """The injector's absolute move, for a compositor whose socket moves nothing; None when the
     injector's devices are gone."""
@@ -331,7 +368,7 @@ def note_motion(dx: float, dy: float) -> None:
 
 def refresh_qt_screens() -> None:
     """Capture Qt geometry on the GUI thread for link and input threads."""
-    global _screens
+    global _screens, _monitors
     try:
         from PySide6.QtCore import QThread
         from PySide6.QtGui import QGuiApplication
@@ -343,6 +380,8 @@ def refresh_qt_screens() -> None:
                    for g in (screen.geometry() for screen in app.screens())]
         with _lock:
             _screens = screens
+            # Qt calls this when a display comes or goes: the compositor is asked afresh too.
+            _monitors = (0.0, _monitors[1])
     except Exception:
         LOGGER.exception("Could not read the displays from Qt")
 
@@ -354,13 +393,7 @@ def monitors() -> List[Rect]:
         at, known = _monitors
         if known and now - at < MONITORS_SECONDS:
             return list(known)
-    ipc = _found()
-    found: List[Rect] = []
-    if ipc is not None:
-        try:
-            found = ipc.monitors()
-        except Exception as exc:
-            _failed("list the displays", exc)
+    found: List[Rect] = _ask("list the displays", lambda ipc: ipc.monitors(), [])
     with _lock:
         if found:
             _monitors = (now, found)
@@ -375,15 +408,12 @@ def display_map() -> dict:
 
 def cursor_position() -> Tuple[int, int]:
     global _position
-    ipc = _found()
-    if ipc is not None and ipc.tells_cursor:
-        try:
-            point = ipc.cursor()
+    if tells_cursor():
+        point = _ask("say where the pointer is", lambda ipc: ipc.cursor())
+        if point is not None:
             with _lock:
                 _position = (float(point[0]), float(point[1]))
             return point
-        except Exception as exc:
-            _failed("say where the pointer is", exc)
     with _lock:
         noted = _position
     if noted is not None:
@@ -398,13 +428,8 @@ def set_cursor_position(x: int, y: int) -> None:
     with _lock:
         _position = (float(x), float(y))
         mover = _mover
-    ipc = _found()
-    if ipc is not None:
-        try:
-            ipc.move(x, y)
-            return
-        except Exception as exc:
-            _failed("move the pointer", exc)
+    if _ask("move the pointer", lambda ipc: ipc.move(x, y) or True, False):
+        return
     if mover is not None:
         try:
             mover(x, y)
@@ -419,37 +444,17 @@ def button_down(name: str) -> bool:
 def keyboard(device: str = "") -> Optional[dict]:
     """What the compositor says of the keyboard layout (hyprland_keyboard, sway_keyboard), or None
     when it says nothing."""
-    ipc = _found()
-    if ipc is None:
-        return None
-    try:
-        return ipc.keyboard(device)
-    except Exception as exc:
-        _failed("say which keyboard layout it has", exc)
-        return None
+    return _ask("say which keyboard layout it has", lambda ipc: ipc.keyboard(device))
 
 
 def plain_pointer(name: str, vendor: int, product: int) -> None:
     """Ask the compositor to move the pointer by exactly what the device named `name` reports, with
     no acceleration: a peer's moves are already the distance it means, and the position noted here
     for sway is only right if a move of ten is ten. A compositor with no socket keeps its default."""
-    ipc = _found()
-    if ipc is None:
-        return
-    try:
-        ipc.plain_pointer(name, vendor, product)
-    except Exception as exc:
-        _failed("turn off acceleration for Beamer's pointer", exc)
+    _ask("turn off acceleration for Beamer's pointer", lambda ipc: ipc.plain_pointer(name, vendor, product))
 
 
 def full_screen_app() -> Optional[str]:
     """The name of the foreground app while it is full screen, else None. GUI thread, once a
     second, as the Mac checks."""
-    ipc = _found()
-    if ipc is None:
-        return None
-    try:
-        return ipc.full_screen()
-    except Exception as exc:
-        _failed("say which app is full screen", exc)
-        return None
+    return _ask("say which app is full screen", lambda ipc: ipc.full_screen())

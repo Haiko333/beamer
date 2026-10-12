@@ -30,6 +30,12 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(platform_parts.backend({"XDG_SESSION_TYPE": "wayland"}, lambda: HYPRLAND), "evdev")
         self.assertEqual(platform_parts.backend({"XDG_SESSION_TYPE": "wayland"}, frozenset), "evdev")
 
+    def test_a_portal_too_slow_to_answer_does_not_take_gnome_or_kde_off_it(self):
+        for desktop, expected in (("GNOME", "portal"), ("KDE", "portal"), ("Hyprland", "evdev"), ("", "evdev")):
+            with self.subTest(desktop=desktop):
+                environ = {"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": desktop}
+                self.assertEqual(platform_parts.backend(environ, lambda: None), expected)
+
     def test_the_environment_names_a_wayland_backend_without_asking(self):
         for forced in ("portal", "evdev", " EVDEV "):
             with self.subTest(forced=forced):
@@ -59,8 +65,9 @@ class LoadTest(unittest.TestCase):
         self.assertEqual([portal.capture.__name__, portal.injector.__name__, portal.clipboard.__name__, portal.desktop.__name__],
                          ["capture_portal", "inject_portal", "clipboard_portal", "desktop_portal"])
         evdev = platform_parts.load("linux", {"XDG_SESSION_TYPE": "wayland"}, lambda: HYPRLAND)
-        for part in (evdev.capture, evdev.injector, evdev.clipboard):
-            self.assertNotIn("portal", getattr(part, "__name__", ""))
+        self.assertEqual([evdev.injector.__name__, evdev.clipboard.__name__, evdev.desktop.__name__],
+                         ["inject_uinput", "clipboard_wl", "desktop_wlroots"])
+        self.assertNotIn("portal", evdev.capture.__name__)
 
     def test_every_capture_part_has_what_the_shell_and_the_settings_read(self):
         for portals in (lambda: GNOME, lambda: HYPRLAND):

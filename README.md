@@ -422,6 +422,25 @@ On Wayland, the desktop limits what Beamer can do:
   Beamer draw at the edges of the screen, so crossings show no effect on this machine. The other
   machines still show theirs.”
 
+On a Wayland desktop with no RemoteDesktop portal, which is Hyprland, sway and the other wlroots
+compositors, Beamer uses back ends that need no portal (this is work in progress in this fork, and
+at this stage such a machine can be driven but cannot yet drive another):
+
+- Keys, the pointer and the wheel are played through a virtual keyboard and mouse made with
+  `/dev/uinput`. Install [`packaging/linux/70-beamer-uinput.rules`](packaging/linux/70-beamer-uinput.rules)
+  as its first lines say. It opens `/dev/uinput` to the person signed in at the machine, and so to
+  every program they run, not to Beamer alone.
+- The clipboard goes through `wl-copy` and `wl-paste` (the `wl-clipboard` package), text and
+  pictures. When a machine sends text and a picture together, the text is what is set.
+- Characters are typed in the layout the compositor says it has. Set `BEAMER_XKB_LAYOUT`, for
+  example to `fr` or `fr(bepo)`, if Beamer reads it wrong; the log names the layout it uses.
+- Alt with Print Screen is never pressed for another machine: on these back ends it would be the
+  kernel's SysRq.
+- `BEAMER_BACKEND=evdev` or `BEAMER_BACKEND=portal` chooses the back ends outright. Beamer picks
+  the portal ones wherever the desktop has the RemoteDesktop portal, as GNOME and KDE do.
+- These back ends need the `python-evdev` package and direct access to `/dev/uinput`, which the
+  Flatpak does not have: run Beamer from source there (`python win_app/kvm_bridge_win.py`).
+
 Older Ubuntu and Debian releases lack the InputCapture portal, so they cannot send input out under
 Wayland; use an X11 session there. Linux does not offer gestures. KDE Plasma awaits hardware
 testing. On KDE Wayland, partly exposed sides in staggered monitor layouts are unavailable;

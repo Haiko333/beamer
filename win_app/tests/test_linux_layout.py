@@ -36,8 +36,17 @@ class SourcesTest(unittest.TestCase):
         self.assertEqual(origins({}, {"descriptions": ["French", "Klingon"]}), [("the system default", "", "")])
 
     def test_an_override_that_is_not_a_layout_is_passed_over(self):
+        linux_layout._warned.clear()
         with self.assertLogs(linux_layout.LOGGER, "WARNING"):
             self.assertEqual(origins({"BEAMER_XKB_LAYOUT": "fr; rm -rf"}), [("the system default", "", "")])
+
+    def test_a_name_xkb_could_not_have_is_passed_over_whoever_says_it(self):
+        linux_layout._warned.clear()
+        with self.assertLogs(linux_layout.LOGGER, "WARNING") as logged:
+            for _ in range(3):
+                found = origins({"XKB_DEFAULT_LAYOUT": "../../etc/passwd"}, {"layout": "fr/../x"}, lambda: linux_layout.Names("us"))
+        self.assertEqual(found, [("the system's keyboard settings", "us", ""), ("the system default", "", "")])
+        self.assertEqual(len(logged.records), 2)  # once for each source, not at every character
 
     def test_override_spellings(self):
         self.assertEqual(linux_layout.parse_override("fr"), Names("fr"))

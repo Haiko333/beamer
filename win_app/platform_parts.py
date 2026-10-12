@@ -46,7 +46,12 @@ def backend(environ, portals=None) -> str:
     forced = environ.get("BEAMER_BACKEND", "").strip().lower()
     if forced in WAYLAND_BACKENDS:
         return forced
-    return "portal" if "RemoteDesktop" in (portals or linux_desktop.portals)() else "evdev"
+    has = (portals or linux_desktop.portals)()
+    if has is None:
+        # A portal that did not answer in time: GNOME and KDE have RemoteDesktop, and what a portal
+        # is slow to say at sign-in must not leave them on the back ends that need a udev rule.
+        return "portal" if linux_desktop.desktop(environ) in ("kde", "gnome") else "evdev"
+    return "portal" if "RemoteDesktop" in has else "evdev"
 
 
 def load(platform: str, environ=os.environ, portals=None) -> SimpleNamespace:

@@ -95,7 +95,8 @@ class Rig(unittest.TestCase):
         self.addCleanup(desktop_wlroots.set_mover, None)
 
     def _reset(self):
-        inject._devices = inject._layout = inject._names = inject._problem = None
+        inject._devices = inject._layout = inject._names = inject._problem = inject._said = None
+        inject._said_at = 0.0
         inject._ready_at = inject._retry_at = 0.0
         inject._settled = False
         inject._stopped = False
@@ -122,6 +123,22 @@ class NamedKeyTest(Rig):
             inject.inject_key(name, True)
             inject.inject_key(name, False)
             self.assertEqual(self.keys(), [(code, True), (code, False)], name)
+
+    def test_alt_with_print_screen_is_the_kernels_sysrq_and_is_never_pressed(self):
+        inject.inject_key("print_screen", True)
+        inject.inject_key("print_screen", False)
+        self.assertEqual(self.keys(), [(99, True), (99, False)])
+        for alt in ("alt", "alt_r"):
+            inject.inject_key(alt, True)
+            with self.assertLogs() if alt == "alt" else mock.patch.object(inject, "_warn_once"):
+                inject.inject_key("print_screen", True)
+            inject.inject_key("b", True, "b")
+            inject.inject_key("b", False, "b")
+            inject.inject_key("print_screen", False)
+            inject.inject_key(alt, False)
+            pressed = [code for code, down in self.keys() if down]
+            self.assertNotIn(99, pressed)
+            self.assertEqual(len(pressed), 2)  # Alt and the letter: an ordinary Alt+B
 
     def test_an_unknown_name_presses_nothing(self):
         inject.inject_key("launch_app1", True)
@@ -194,6 +211,35 @@ class FrenchLayoutTest(Rig):
         self.keys()
         inject.inject_text("aé")
         self.assertEqual(self.keys(), [(CTRL, False), (16, True), (16, False), (3, True), (3, False), (CTRL, True)])
+
+
+class LayoutTest(Rig):
+    def test_the_compositor_is_asked_for_the_layout_once_a_second_not_at_every_character(self):
+        asked = []
+        with mock.patch.object(desktop_wlroots, "keyboard", lambda device: asked.append(device)):
+            for _ in range(20):
+                inject.inject_key("a", True, "a")
+                inject.inject_key("a", False, "a")
+            self.assertEqual(asked, ["Beamer virtual keyboard"])
+            with mock.patch.object(inject.time, "monotonic", return_value=inject.time.monotonic() + inject.LAYOUT_SECONDS + 1):
+                inject.inject_key("a", True, "a")
+        self.assertEqual(len(asked), 2)
+
+    def test_a_layout_that_cannot_be_compiled_is_tried_once_not_at_every_character(self):
+        tried = []
+
+        def broken(said=None):
+            tried.append(True)
+            raise RuntimeError("libxkbcommon is not installed")
+
+        with mock.patch.object(inject, "_keymap", broken), mock.patch.object(inject, "_warn_once"):
+            for _ in range(5):
+                inject.inject_key("a", True, "a")
+                inject.inject_key("a", False, "a")
+        self.assertEqual((len(tried), self.keys()), (1, []))
+        # Named keys need no layout and are still pressed.
+        inject.inject_key("enter", True)
+        self.assertEqual(self.keys(), [(28, True)])
 
 
 class PointerTest(Rig):
@@ -292,6 +338,22 @@ class LifeTest(Rig):
         with mock.patch.object(inject.time, "monotonic", return_value=inject.time.monotonic() + inject.RETRY_SECONDS + 1):
             inject.inject_mouse_move(2, 2)
         self.assertEqual((self.made, self.devices.events), (2, [("move", 2, 2)]))
+
+    def test_a_key_held_when_the_devices_went_is_not_thought_held_on_the_new_ones(self):
+        closed = []
+        self.keymap.close = lambda: closed.append(True)
+        inject.inject_key("a", True, "a")
+        inject.inject_key("enter", True)
+        self.devices.broken = True
+        inject.inject_mouse_move(1, 1)
+        self.assertEqual(closed, [True])  # the layout's keymap is not leaked
+        self.keymap = real_keymap(self.layout)
+        self.devices = FakeDevices()
+        with mock.patch.object(inject.time, "monotonic", return_value=inject.time.monotonic() + inject.RETRY_SECONDS + 1):
+            # The peer still holds both: its repeats are presses on the new keyboard.
+            inject.inject_key("enter", True)
+            inject.inject_key("a", True, "a")
+        self.assertEqual(self.keys(), [(28, True), (30, True)])
 
 
 class NoDevicesTest(Rig):

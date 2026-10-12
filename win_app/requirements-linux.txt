@@ -9,3 +9,7 @@ six==1.17.0
 # dependencies), with fd passing for libei's connection and the clipboard's transfers. libei and
 # libxkbcommon are the system's, reached through ctypes (win_app/libei.py, xkb_x11.py).
 jeepney==0.9.0
+# The evdev back ends, for a Wayland desktop with no RemoteDesktop portal (Hyprland, sway), make
+# their virtual keyboard and mouse through python-evdev (BSD, a C extension over the kernel's
+# headers). Imported only when those devices are made, so the X11 and portal back ends run without it.
+evdev>=1.6
