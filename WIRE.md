@@ -1092,6 +1092,11 @@ A key travels as `key`, a name, in `keydown` and `keyup`:
   keys send their character (`"1"`, `"+"`). When Windows cannot compose a dead key and the next
   character into one code point, it sends the visible sequence through `text` instead; a held base
   key repeats its character as `text` and its physical key-up remains swallowed.
+  A Linux sender that reads the keyboard below the compositor also uses `text`, for a receiver
+  that advertises it: the character AltGr reaches on its layout (`@` or `€` on a French keyboard),
+  and what a dead key and the next character type (`ê`, or `^x` where there is no such letter),
+  with AltGr let go around it as section 10 asks. Such a key sends no `keyup` and does not repeat.
+  To a receiver without `text`, and under Control, Alt or Command, it sends the keys as above.
 - **`us`** is sent beside a character: the unshifted, lower-case character the same key position
   types on a US layout, for a receiver whose layout cannot type `key`. A key with no US
   character (on a JIS keyboard, say) sends none.
