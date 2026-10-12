@@ -468,7 +468,7 @@ They take two permissions, each its own udev rule, so that a machine has only th
   `cd packaging/arch && makepkg -si`, then `beamer`. It builds what is pushed to this fork's branch,
   not the working tree. It puts neither udev rule in force: both are left in `/usr/share/doc/beamer` as
   examples to install by hand, for the reasons given above, and the note shown after installing
-  says what each opens and has the commands to turn it on and to take it back.
+  says what each opens and has the commands to turn it on and to take it back. Installed and run on one Arch laptop under Hyprland, with the system's `pyside6`.
 - To start Beamer with a Hyprland session, add `exec-once = beamer --hidden` to `hyprland.conf`
   (with the Arch package; from source, the full path of the Python and of
   `win_app/kvm_bridge_win.py` in place of `beamer`). Hyprland by itself does not run the XDG
