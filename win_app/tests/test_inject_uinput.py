@@ -130,8 +130,9 @@ class NamedKeyTest(Rig):
         self.assertEqual(self.keys(), [(99, True), (99, False)])
         for alt in ("alt", "alt_r"):
             inject.inject_key(alt, True)
-            with self.assertLogs() if alt == "alt" else mock.patch.object(inject, "_warn_once"):
+            with mock.patch.object(inject, "_warn_once") as warned:
                 inject.inject_key("print_screen", True)
+            warned.assert_called_once()
             inject.inject_key("b", True, "b")
             inject.inject_key("b", False, "b")
             inject.inject_key("print_screen", False)
@@ -179,9 +180,13 @@ class UsLayoutTest(Rig):
         self.assertEqual(self.keys(), [(CTRL, True), (30, True), (30, False), (CTRL, False)])
 
     def test_a_character_this_layout_has_no_key_for_is_not_typed(self):
-        with self.assertLogs(inject.LOGGER.parent.getChild("inject_x11"), "WARNING"):
+        import inject_x11
+
+        # Said once in the life of the process, so the saying itself is what is checked.
+        with mock.patch.object(inject_x11, "_warn_once") as warned:
             inject.inject_key("é", True, "2")
         self.assertEqual(self.keys(), [])
+        warned.assert_called_once()
 
 
 class FrenchLayoutTest(Rig):
