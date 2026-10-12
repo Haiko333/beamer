@@ -36,7 +36,8 @@ class FakeSystem:
         self.grab_log = []
         self.down = {}         # path: codes the kernel has as held
         self.led = {}          # path: LEDs lit
-        self.taps = []
+        self.log = []          # ("release", path, code) and ("grab", path, on), in order
+        self.deaf = set()      # paths whose kernel keeps a key as held whatever is written
         self._next = 100
 
     def paths(self):
@@ -69,6 +70,7 @@ class FakeSystem:
             raise OSError(19, "No such device")
         (self.grabs.add if on else self.grabs.discard)(fd)
         self.grab_log.append((self.path_of(fd), on))
+        self.log.append(("grab", self.path_of(fd), on))
 
     def keys_down(self, fd):
         return set(self.down.get(self.path_of(fd), ()))
@@ -76,10 +78,14 @@ class FakeSystem:
     def leds(self, fd):
         return set(self.led.get(self.path_of(fd), ()))
 
-    def tap(self, fd, code):
+    def release(self, fd, code):
+        """As the kernel takes it: the key is up from then on, for whoever reads the device."""
         if self.opened[fd][1] & os.O_ACCMODE == os.O_RDONLY:
             raise OSError(9, "Bad file descriptor")
-        self.taps.append((self.path_of(fd), code))
+        path = self.path_of(fd)
+        self.log.append(("release", path, code))
+        if path not in self.deaf:
+            self.down[path] = set(self.down.get(path, ())) - {code}
 
 
 class FakeContext:
@@ -366,10 +372,7 @@ class GrabTest(Rig):
         self.away = True
         self.turn()
         self.assertEqual(len(self.grabbed_paths()), 3)
-        self.system.down[TOUCHPAD] = set()
-        self.away = False
-        self.turn()
-        self.assertEqual(self.system.taps, [])
+        self.assertEqual([entry for entry in self.system.log if entry[0] == "release"], [])
 
     def test_the_guard_is_told_the_devices_are_free_as_soon_as_they_are(self):
         self.open()
@@ -384,23 +387,27 @@ class GrabTest(Rig):
             self.hooks._force_home("a test")
         self.assertEqual(order, ["ungrab"] * 3 + [("guard", False), "app told"])
 
-    def test_a_key_pressed_while_the_devices_were_being_taken_is_one_the_desktop_saw_go_down(self):
+    def test_a_key_pressed_while_the_devices_were_being_taken_is_let_go_for_the_desktop_too(self):
+        # It went down after the look at what was held and before its device was taken: the
+        # desktop saw the press. The device is given back for the moment it takes to write the
+        # release, or the desktop would repeat the key for as long as input is away.
         self.open()
         real = self.system.grab
+        pressed = []
 
         def grab(fd, on):
             real(fd, on)
-            if on:
-                self.system.down[KEYBOARD] = {CTRL_R}
+            if on and not pressed and self.system.path_of(fd) == KEYBOARD:
+                pressed.append(True)
+                self.system.down[KEYBOARD] = {KEY_A}
 
         self.system.grab = grab
         self.away = True
         self.turn()
-        self.system.grab = real
-        self.system.down[KEYBOARD] = set()
-        self.away = False
-        self.turn()
-        self.assertEqual(self.system.taps, [(KEYBOARD, CTRL_R)])
+        self.assertEqual([entry for entry in self.system.log if entry[1] == KEYBOARD],
+                         [("grab", KEYBOARD, True), ("grab", KEYBOARD, False), ("release", KEYBOARD, KEY_A), ("grab", KEYBOARD, True)])
+        self.assertEqual(self.system.down[KEYBOARD], set())
+        self.assertEqual(len(self.grabbed_paths()), 3)
 
     def test_a_key_that_types_is_waited_for_briefly_before_the_grab(self):
         self.open()
@@ -429,79 +436,111 @@ class GrabTest(Rig):
 
 
 class HeldThroughTest(Rig):
-    """A key held when the grab is taken and let go during it: the desktop never saw the release."""
+    """A key held when the grab is taken. Grabbed, the device would never show the desktop its
+    release, and the desktop would repeat the key for as long as input is away. So the release is
+    written to the device before it is taken: the desktop reads it as it reads the key itself."""
 
     def grab_holding(self, path, code):
         self.open()
         self.system.down[path] = {code}
-        self.feed(("key", self.device(path), code, True))
+        self.feed(("key" if path == KEYBOARD else "button", self.device(path), code, True))
         self.away = True
         self.turn()
         self.turn(capture.GRAB_WAIT_SECONDS)  # a button is waited for as a key that types is
         self.assertTrue(self.hooks.grabbed)
         self.keys.clear()
+        self.mouse.clear()
 
-    def test_the_desktop_is_shown_the_release_when_the_grab_ends(self):
-        self.grab_holding(KEYBOARD, CTRL_R)
-        self.system.down[KEYBOARD] = set()
-        self.feed(("key", self.device(KEYBOARD), CTRL_R, False))
-        self.away = False
-        self.turn()
-        self.assertEqual(self.system.taps, [(KEYBOARD, CTRL_R)])
-        # The tap is ungrabbed first: grabbed, it would come back to Beamer alone.
-        self.assertEqual(self.grabbed_paths(), [])
-
-    def test_beamers_own_tap_is_not_taken_for_the_user_pressing_the_key(self):
-        self.grab_holding(KEYBOARD, CTRL_R)
-        self.system.down[KEYBOARD] = set()
-        self.feed(("key", self.device(KEYBOARD), CTRL_R, False))
-        self.away = False
-        self.turn()
-        self.keys.clear()
-        device = self.device(KEYBOARD)
-        self.feed(("key", device, CTRL_R, True), ("key", device, CTRL_R, False))
-        self.assertEqual(self.keys, [])
-        # The next press is the user's.
-        self.feed(("key", device, CTRL_R, True))
-        self.assertEqual([key[:3] for key in self.keys], [("cmd_r", True, CTRL_R)])
-
-    def test_a_tap_that_never_comes_back_does_not_eat_a_later_press(self):
-        self.grab_holding(KEYBOARD, CTRL_R)
-        self.system.down[KEYBOARD] = set()
-        self.away = False
-        self.turn()
-        self.keys.clear()
-        self.now += capture.SWALLOW_SECONDS + 0.1
-        self.feed(("key", self.device(KEYBOARD), CTRL_R, True))
-        self.assertEqual(len(self.keys), 1)
-
-    def test_a_key_still_held_when_the_grab_ends_is_left_alone(self):
-        self.grab_holding(KEYBOARD, CTRL_R)
-        self.away = False
-        self.turn()
-        self.assertEqual(self.system.taps, [])
-
-    def test_only_a_modifier_is_tapped_never_a_button_or_a_key_that_types(self):
-        # A press the desktop took for a new one would be a click made or a letter typed.
-        for path, code in ((MOUSE, BTN_LEFT), (KEYBOARD, KEY_A)):
+    def test_a_held_key_is_let_go_on_its_device_before_the_device_is_taken(self):
+        for path, code in ((KEYBOARD, KEY_A), (KEYBOARD, CTRL_R), (MOUSE, BTN_LEFT)):
             with self.subTest(code=code):
                 self.setUp()
                 self.grab_holding(path, code)
-                self.system.down[path] = set()
-                self.away = False
-                with self.assertLogs(capture.LOGGER, "WARNING"):
-                    self.turn()
-                self.assertEqual(self.system.taps, [])
+                mine = [entry for entry in self.system.log if entry[1] == path]
+                self.assertEqual(mine, [("release", path, code), ("grab", path, True)])
+                # Not taken on trust: the kernel is asked again once everything is grabbed.
+                self.assertEqual(self.system.down[path], set())
                 self.hooks._end()
 
-    def test_a_device_that_cannot_be_written_to_is_logged_and_nothing_fails(self):
-        self.system.read_only = {KEYBOARD}
-        self.grab_holding(KEYBOARD, CTRL_R)
-        self.system.down[KEYBOARD] = set()
+    def test_the_release_beamer_wrote_is_the_keys_release_for_the_bridge_too(self):
+        self.grab_holding(KEYBOARD, KEY_A)
+        self.feed(("key", self.device(KEYBOARD), KEY_A, False))
+        self.assertEqual([key[:2] for key in self.keys], [("a", False)])
+
+    def test_the_keyboard_saying_again_that_the_key_is_held_presses_nothing_anywhere(self):
+        # A laptop's keyboard repeats a held key itself; after the release Beamer wrote, the kernel
+        # takes the next of those for a new press. It is the same hold, and neither it nor its
+        # release, when the finger lifts at last, is a key for the peer.
+        self.grab_holding(KEYBOARD, KEY_A)
+        device = self.device(KEYBOARD)
+        self.feed(("key", device, KEY_A, False))
+        self.keys.clear()
+        self.now += 0.25
+        self.feed(("key", device, KEY_A, True))
+        self.now += 5.0
+        self.feed(("key", device, KEY_A, False))
+        self.assertEqual(self.keys, [])
+        # The next press is the user's.
+        self.feed(("key", device, KEY_A, True))
+        self.assertEqual([key[:2] for key in self.keys], [("a", True)])
+
+    def test_a_held_button_said_again_is_no_click(self):
+        self.grab_holding(MOUSE, BTN_LEFT)
+        device = self.device(MOUSE)
+        self.feed(("button", device, BTN_LEFT, False))
+        self.mouse.clear()
+        self.feed(("button", device, BTN_LEFT, True), ("button", device, BTN_LEFT, False))
+        self.assertEqual(self.mouse, [])
+
+    def test_a_keyboard_that_does_not_repeat_does_not_cost_the_next_press(self):
+        # A USB keyboard says nothing more of a held key, and the kernel drops its release.
+        self.grab_holding(KEYBOARD, KEY_A)
+        self.now += capture.GHOST_SECONDS + 0.1
+        self.feed(("key", self.device(KEYBOARD), KEY_A, True))
+        self.assertEqual([key[:2] for key in self.keys], [("a", True)])
+
+    def test_a_shift_held_since_before_the_grab_still_counts_for_the_way_home(self):
+        self.grab_holding(KEYBOARD, capture.KEY_LEFTSHIFT)
+        device = self.device(KEYBOARD)
+        self.feed(("key", device, capture.KEY_LEFTSHIFT, False), ("key", device, capture.KEY_LEFTSHIFT, True),
+                  ("key", device, capture.KEY_RIGHTSHIFT, True))
+        with self.assertLogs(capture.LOGGER, "WARNING"):
+            self.feed(("key", device, capture.KEY_ESC, True))
+        self.assertFalse(self.hooks.grabbed)
+
+    def test_home_again_before_the_keyboard_repeats_the_key_is_the_desktops_and_the_bridges(self):
+        self.grab_holding(KEYBOARD, KEY_A)
         self.away = False
+        self.turn()
+        self.feed(("key", self.device(KEYBOARD), KEY_A, True))
+        self.assertEqual([key[:2] for key in self.keys], [("a", True)])
+
+    def test_nothing_is_written_to_a_device_when_the_grab_ends(self):
+        self.grab_holding(KEYBOARD, CTRL_R)
+        before = len(self.system.log)
+        self.away = False
+        self.turn()
+        self.assertEqual(self.system.log[before:], [("grab", path, False) for path in (KEYBOARD, MOUSE, TOUCHPAD)])
+
+    def test_a_device_that_cannot_be_written_to_is_said_and_the_grab_is_taken(self):
+        self.system.read_only = {KEYBOARD}
+        self.open()
+        self.system.down[KEYBOARD] = {CTRL_R}
+        self.away = True
+        with self.assertLogs(capture.LOGGER, "WARNING") as logs:
+            self.turn()
+        self.assertTrue(self.hooks.grabbed)
+        self.assertIn("read only", "".join(logs.output))
+
+    def test_a_key_the_kernel_keeps_as_held_is_said_and_tried_no_more_than_twice(self):
+        self.system.deaf = {KEYBOARD}
+        self.open()
+        self.system.down[KEYBOARD] = {CTRL_R}
+        self.away = True
         with self.assertLogs(capture.LOGGER, "WARNING"):
             self.turn()
-        self.assertEqual(self.system.taps, [])
+        self.assertTrue(self.hooks.grabbed)
+        self.assertEqual(self.system.log.count(("release", KEYBOARD, CTRL_R)), 2)
 
 
 class WaysHomeTest(Rig):

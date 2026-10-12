@@ -25,12 +25,14 @@ home that do not depend on the part that went wrong:
 
 And one for trying it out: BEAMER_GRAB_MAX_SECONDS lets go after that long whatever happens.
 
-A modifier held when the grab is taken (the shortcut's own key, most often) is let go of where
-the desktop cannot see it. When the grab ends, the desktop is shown that release (the key is
-pressed and released again on its own device), or it would think it held until it was next
-touched. Only modifiers: a press the desktop took for a new one would be a letter typed or a
-click made, where a modifier's is nothing. A key that types and a mouse button are waited for
-briefly before the grab instead, and one still held after that is named in the log.
+A key held when the grab is taken (the shortcut's own key, most often) would be let go of where
+the desktop cannot see it, and the desktop would repeat it for as long as input is away. So its
+release is written to its own device before the device is taken: the desktop reads it as it reads
+the key, and the kernel has the key as up from then on, which is asked again once everything is
+grabbed. A key that types and a mouse button are waited for briefly first, since a finger lifting
+is better than Beamer saying it has. A keyboard that repeats a held key itself (a laptop's does)
+then presses it again as far as the kernel can tell: that press and its release are the old hold
+still, and go to nobody. Whoever holds a key across the switch presses it again on the other side.
 
 The devices, the guard and libinput are seams, so everything but the kernel's part is tested
 without a keyboard. Nothing here is imported until the hooks start, so this module imports anywhere."""
@@ -94,9 +96,9 @@ SCAN_SECONDS = 2.0
 # A grab waits this long for a key that types (not a modifier) to be let go, so the desktop is
 # not left repeating it; then it is taken anyway.
 GRAB_WAIT_SECONDS = 0.5
-# Beamer's own tap on a device comes back to it within a turn of the loop; one not read by then
-# is not waited for.
-SWALLOW_SECONDS = 0.5
+# How long after Beamer let go of a held key for the desktop a new press of it is still that same
+# hold, said again by a keyboard that repeats its keys itself (a second at most before the first).
+GHOST_SECONDS = 1.5
 # How long what the compositor said of the keyboard layout is gone by.
 LAYOUT_SECONDS = 1.0
 # libinput's scroll units for one click of a wheel.
@@ -109,7 +111,7 @@ HOME_MOTION_SECONDS = 1 / 60
 EVDEV_BUTTONS = {0x110: 1, 0x111: 3, 0x112: 2, 0x113: 8, 0x114: 9}
 # The core modifier bits a held key sets.
 HELD_MODS = {42: 1, 54: 1, 29: 4, 97: 4, 56: 8, 125: 64, 126: 64}
-# Keys the desktop may be left thinking held through a grab: they type nothing while they wait.
+# Keys a grab does not wait for: they type nothing, and the shortcut's own are among them.
 MODIFIER_CODES = frozenset(HELD_MODS) | {100}
 KEY_ESC, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_CAPSLOCK, KEY_NUMLOCK = 1, 42, 54, 58, 69
 PANIC_CHORD = frozenset({KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_ESC})
@@ -197,12 +199,10 @@ class System:
     def leds(self, fd: int) -> Set[int]:
         return _bits(fcntl.ioctl(fd, EVIOCGLED, bytes(_LED_BYTES)))
 
-    def tap(self, fd: int, code: int) -> None:
-        """A press and a release of `code` on the device itself, as if its key were touched. The
-        kernel passes on only what changes its own note of the key, so a release alone, of a key
-        it knows is up, would go nowhere."""
-        for value in (1, 0):
-            os.write(fd, _EVENT.pack(0, 0, EV_KEY, code, value) + _EVENT.pack(0, 0, EV_SYN, 0, 0))
+    def release(self, fd: int, code: int) -> None:
+        """Write the release of `code` to the device itself: everyone reading it, the desktop
+        among them, sees the key let go, and the kernel has it as up."""
+        os.write(fd, _EVENT.pack(0, 0, EV_KEY, code, 0) + _EVENT.pack(0, 0, EV_SYN, 0, 0))
 
 
 class Guard:
@@ -301,11 +301,11 @@ class Hooks:
         self._ignored: Set[str] = set()            # paths libinput would not have, or Beamer's own
         self._down: Set[Tuple[int, int]] = set()   # (device, code) held, keys and buttons
         self._names_down: Dict[Tuple[int, int], str] = {}
-        self._swallow: Dict[Tuple[int, int], Tuple[int, float]] = {}  # taps of Beamer's own still to be read
+        self._ghosts: Dict[Tuple[int, int], float] = {}  # let go by Beamer at the grab: until when a press is the old hold
+        self._ghost_down: Set[Tuple[int, int]] = set()   # such a press, till its release
         self._grabbed = False
         self._grabbed_at = 0.0
         self._wanted_at: Optional[float] = None
-        self._held_at_grab: Dict[str, Set[int]] = {}
         self._refused = False        # let go by force: not grabbed again until input has been home
         self._flips: Set[int] = set()  # lock keys pressed during this grab, which no LED shows
         self._keymap = None
@@ -597,7 +597,10 @@ class Hooks:
             self._refused = True
             self._fail(CaptureUnavailable(NO_GUARD.format(detail=exc)))
             return
+        # Before anything is taken: what is held is let go where the desktop still reads it.
+        self._release(held)
         failed = None
+        taken = set()
         with self._lock:
             # Said first: whatever happens from here, every way home lets go of every device.
             self._grabbed = True
@@ -605,6 +608,7 @@ class Hooks:
             for path, fd in self._fds.items():
                 try:
                     self._system.grab(fd, True)
+                    taken.add(path)
                 except OSError as exc:
                     if exc.errno == EBUSY:
                         # Another program holds it (a remapper, say) and the desktop gets nothing
@@ -613,17 +617,59 @@ class Hooks:
                         continue
                     failed = f"{path}: {exc}"
                     break
+        if failed is None:
+            failed = self._release_again(taken)
         if failed is not None:
             # All or nothing: a keyboard left with the desktop would type here and there at once.
             self._force_home(GRAB_FAILED.format(detail=failed))
             return
         self._grabbed_at = now
-        # Looked at again now that nothing more reaches the desktop: a key pressed while the
-        # devices were being taken is one it saw go down.
-        for path, codes in self._held().items():
-            held.setdefault(path, set()).update(codes)
-        self._held_at_grab = held
         self._flips = set()
+
+    def _release(self, held: Dict[str, Set[int]]) -> None:
+        """Write the release of every key and button in `held` to its device, and note each as one
+        a keyboard may say again."""
+        devices = {path: device for device, path in self._paths.items()}
+        until = self._clock() + GHOST_SECONDS
+        for path, codes in held.items():
+            fd = self._fds.get(path)
+            if fd is None:
+                continue
+            for code in sorted(codes):
+                try:
+                    self._system.release(fd, code)
+                except OSError as exc:
+                    LOGGER.warning("%s is read only (%s): a key or button held on it as input left cannot be shown "
+                                   "as let go, and the desktop may repeat it until it is touched again", path, exc)
+                    break
+                self._ghosts[(devices.get(path), code)] = until
+
+    def _release_again(self, taken: Set[str]) -> Optional[str]:
+        """Ask the kernel, now that nothing more reaches the desktop, whether anything is held
+        after all: a key that went down while the devices were being taken, which the desktop saw.
+        Its device is given back for the moment it takes to write the release. Returns what went
+        wrong when a device could not be taken again."""
+        again = {path: codes for path, codes in self._held().items() if path in taken}
+        if not again:
+            return None
+        with self._lock:
+            for path in again:
+                try:
+                    self._system.grab(self._fds[path], False)
+                except (OSError, KeyError):
+                    pass
+        self._release(again)
+        with self._lock:
+            for path in again:
+                try:
+                    self._system.grab(self._fds[path], True)
+                except (OSError, KeyError) as exc:
+                    return f"{path}: {exc}"
+        for path, codes in self._held().items():
+            if path in again:
+                LOGGER.warning("%s still has a key or button (%s) as held after its release was written twice; "
+                               "the desktop may repeat it while input is away", path, sorted(codes))
+        return None
 
     def _ungrab_all(self) -> Dict[str, int]:
         """Let go of every device, whatever the flag says, and tell the guard there is nothing
@@ -645,37 +691,11 @@ class Hooks:
         return fds
 
     def _let_go(self) -> None:
-        fds = self._ungrab_all()
-        held, self._held_at_grab = self._held_at_grab, {}
+        self._ungrab_all()
         # The lock keys pressed while away changed nothing the desktop knows of.
         self._flips = set()
-        self._after_grab(fds, held)
-
-    def _after_grab(self, fds: Dict[str, int], held: Dict[str, Set[int]]) -> None:
-        """Show the desktop the release of each key that was held when the grab was taken and let
-        go during it. Beamer reads those taps too, and passes over them."""
-        devices = {path: device for device, path in self._paths.items()}
-        for path, codes in held.items():
-            fd = fds.get(path)
-            if fd is None:
-                continue
-            try:
-                still = self._system.keys_down(fd)
-            except OSError:
-                continue
-            for code in sorted(codes - still):
-                if code not in MODIFIER_CODES:
-                    LOGGER.warning("A key or button (%s) held when input left was let go while it was away; the "
-                                   "desktop still has it as held until it is touched once", code)
-                    continue
-                key = (devices.get(path), code)
-                # Before the tap: its press may be read back before the write of its release returns.
-                self._swallow[key] = (2, self._clock() + SWALLOW_SECONDS)
-                try:
-                    self._system.tap(fd, code)
-                except OSError as exc:
-                    self._swallow.pop(key, None)
-                    LOGGER.warning("Could not show the desktop that key %s was let go (%s); touch it once", code, exc)
+        # A key the keyboard has yet to say again is, from here, pressed for the desktop as well.
+        self._ghosts.clear()
 
     def _force_home(self, sentence: str) -> None:
         """Let go now and say why; not grabbed again until the predicate has said input is home."""
@@ -706,28 +726,34 @@ class Hooks:
         elif kind == "scroll":
             self._wheel(event[3] / SCROLL_PER_CLICK * WHEEL_DELTA, event[2] / SCROLL_PER_CLICK * WHEEL_DELTA)
 
-    def _swallowed(self, device: int, code: int) -> bool:
-        left, until = self._swallow.get((device, code), (0, 0.0))
-        if not left:
+    def _old_hold(self, key: Tuple[int, int], down: bool) -> bool:
+        """Whether this press or release is of a hold Beamer already let go of for everyone, when
+        the grab was taken: the keyboard saying again that the key is down, and then its release."""
+        if not down:
+            if key in self._ghost_down:
+                self._ghost_down.discard(key)
+                return True
             return False
-        if left == 1 or self._clock() > until:
-            del self._swallow[(device, code)]
-        else:
-            self._swallow[(device, code)] = (left - 1, until)
-        # One that never came back is not waited for: the key's next real press is the user's.
-        return self._clock() <= until
+        until = self._ghosts.pop(key, None)
+        if until is None or not self._grabbed or self._clock() > until:
+            return False
+        self._ghost_down.add(key)
+        return True
 
     def _key(self, device: int, code: int, down: bool) -> None:
-        if self._swallowed(device, code):
-            return
-        (self._down.add if down else self._down.discard)((device, code))
+        key = (device, code)
+        old = self._old_hold(key, down)
+        if not old:
+            (self._down.add if down else self._down.discard)(key)
         if self._grabbed:
-            if down and PANIC_CHORD <= {held for _device, held in self._down}:
+            # A Shift held since before the grab counts: the way home asks nothing to be let go first.
+            if down and PANIC_CHORD <= {held for _device, held in self._down | self._ghost_down}:
                 self._force_home(PANIC)
                 return
-            if down and code in (KEY_CAPSLOCK, KEY_NUMLOCK):
+            if down and not old and code in (KEY_CAPSLOCK, KEY_NUMLOCK):
                 self._flips ^= {code}
-        key = (device, code)
+        if old:
+            return
         name = self._names_down.get(key) if down else self._names_down.pop(key, None)
         if name is None:
             name = VK_TO_NAME.get(code)
@@ -782,7 +808,7 @@ class Hooks:
         return self._keymap, (self._said or {}).get("group", 0)
 
     def _button(self, device: int, code: int, down: bool) -> None:
-        if self._swallowed(device, code):
+        if self._old_hold((device, code), down):
             return
         (self._down.add if down else self._down.discard)((device, code))
         fixed = _BUTTONS.get(EVDEV_BUTTONS.get(code))
