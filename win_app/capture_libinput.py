@@ -25,9 +25,12 @@ home that do not depend on the part that went wrong:
 
 And one for trying it out: BEAMER_GRAB_MAX_SECONDS lets go after that long whatever happens.
 
-A key held when the grab is taken (the shortcut's own, most often) is let go of where the desktop
-cannot see it. When the grab ends, the desktop is shown that release (the key is pressed and
-released again on its own device), or it would think the key held until it was next touched.
+A modifier held when the grab is taken (the shortcut's own key, most often) is let go of where
+the desktop cannot see it. When the grab ends, the desktop is shown that release (the key is
+pressed and released again on its own device), or it would think it held until it was next
+touched. Only modifiers: a press the desktop took for a new one would be a letter typed or a
+click made, where a modifier's is nothing. A key that types and a mouse button are waited for
+briefly before the grab instead, and one still held after that is named in the log.
 
 The devices, the guard and libinput are seams, so everything but the kernel's part is tested
 without a keyboard. Nothing here is imported until the hooks start, so this module imports anywhere."""
@@ -107,6 +110,10 @@ HELD_MODS = {42: 1, 54: 1, 29: 4, 97: 4, 56: 8, 125: 64, 126: 64}
 MODIFIER_CODES = frozenset(HELD_MODS) | {100}
 KEY_ESC, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_CAPSLOCK, KEY_NUMLOCK = 1, 42, 54, 58, 69
 PANIC_CHORD = frozenset({KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_ESC})
+# What the kernel lists as held that matters to a grab: a keyboard's keys and a mouse's buttons. A
+# touchpad lists a resting finger as held too (BTN_TOUCH, BTN_TOOL_FINGER), which is neither.
+_KEYBOARD_CODES, _MOUSE_BUTTONS = range(1, 0x100), range(0x110, 0x118)
+EBUSY = 16
 LED_NUML, LED_CAPSL = 0, 1
 
 # The kernel's own: linux/input.h.
@@ -134,6 +141,8 @@ NO_DEVICES = "Beamer found no keyboard or mouse to read on this machine, so it c
 MISSING = "Beamer cannot read this machine's keyboard and mouse: {detail}"
 NO_GUARD = ("Beamer did not take this machine's keyboard: the guard that would give it back if Beamer hung "
             "could not be started ({detail}).")
+GRAB_FAILED = ("Beamer could not take this machine's keyboard and mouse ({detail}), so input stays here: taken in "
+               "part, what is typed would go to the other machine and to this one at once.")
 STALLED = ("Beamer stopped answering while it held this machine's keyboard and mouse, so it let go of them "
            "and input is back here.")
 PANIC = "Both Shift keys and Esc: Beamer let go of this machine's keyboard and mouse, and input is back here."
@@ -313,7 +322,13 @@ class Hooks:
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
-            return
+            if not self._stopping.is_set():
+                return
+            # Stopped but still at it (a callback that has not returned): given a moment, and not
+            # doubled.
+            self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                raise CaptureUnavailable(ENDED.format(detail="the last capture has not stopped yet"))
         self._stopping.clear()
         self._ready.clear()
         self._failure = None
@@ -323,6 +338,8 @@ class Hooks:
         self._ready.wait(5.0)
         if self._failure is not None:
             raise self._failure
+        if self._watchdog is not None and self._watchdog.is_alive():
+            self._watchdog.join(timeout=TICK_SECONDS * 8)  # one on its way out after a stop
         if self._watchdog is None or not self._watchdog.is_alive():
             self._watchdog = threading.Thread(target=self._watch, name="Beamer-hooks-watch", daemon=True)
             self._watchdog.start()
@@ -350,24 +367,12 @@ class Hooks:
 
     def _let_go_from_outside(self) -> bool:
         """End the grab from another thread than the capture's. True when there was one."""
-        with self._lock:
-            if not self._grabbed:
-                return False
-            for fd in list(self._fds.values()):
-                try:
-                    self._system.grab(fd, False)
-                except OSError:
-                    pass
-            self._grabbed = False
+        was = self._grabbed
+        self._ungrab_all()
+        if was:
             self._refused = True
-            guard = self._guard
-        if guard is not None:
-            # The devices are free: the guard has nothing left to end Beamer for.
-            try:
-                guard.beat(False)
-            except OSError:
-                pass
-        return True
+            self._flips = set()
+        return was
 
     def _watch(self) -> None:
         while not self._stopping.wait(TICK_SECONDS * 4):
@@ -376,7 +381,10 @@ class Hooks:
                 return
             if self._grabbed and self._clock() - self._tick_at > STALL_SECONDS and self._let_go_from_outside():
                 LOGGER.error("The capture thread stalled while the devices were grabbed; they were let go")
-                self._fail(CaptureUnavailable(STALLED))
+                # Told from a thread of its own: what stalled the capture may hold what the app's
+                # answer waits on, and the watchdog must stay free to let go again.
+                threading.Thread(target=self._fail, args=(CaptureUnavailable(STALLED),), name="Beamer-hooks-told",
+                                 daemon=True).start()
 
     # -- the thread --------------------------------------------------------------
 
@@ -389,6 +397,9 @@ class Hooks:
             denied = self._scan()
             if not self._paths:
                 raise CaptureUnavailable(NO_ACCESS if denied else NO_DEVICES)
+            if denied:
+                LOGGER.warning("%s input devices are not open to this user and are not read; what is typed on "
+                               "them stays on this machine", denied)
             self._permission("ready")
             self._ready.set()
             poller = select.poll()
@@ -402,7 +413,11 @@ class Hooks:
                 except OSError:
                     pass
                 for event in self._context.events():
-                    self._handle(event)
+                    try:
+                        self._handle(event)
+                    except Exception:
+                        # One key the app could not take is not the end of the capture.
+                        LOGGER.exception("An input event could not be passed on")
                 self._settle(now)
                 if now >= self._next_scan:
                     self._scan()
@@ -424,15 +439,7 @@ class Hooks:
             self._ready.set()
 
     def _end(self) -> None:
-        with self._lock:
-            grabbed, self._grabbed = self._grabbed, False
-            fds = list(self._fds.values())
-        if grabbed:
-            for fd in fds:
-                try:
-                    self._system.grab(fd, False)
-                except OSError:
-                    pass
+        self._ungrab_all()
         if self._guard is not None:
             self._guard.close()
             self._guard = None
@@ -561,7 +568,7 @@ class Hooks:
         held = {}
         for path, fd in list(self._fds.items()):
             try:
-                codes = self._system.keys_down(fd)
+                codes = {code for code in self._system.keys_down(fd) if code in _KEYBOARD_CODES or code in _MOUSE_BUTTONS}
             except OSError:
                 codes = set()
             if codes:
@@ -583,28 +590,58 @@ class Hooks:
             self._refused = True
             self._fail(CaptureUnavailable(NO_GUARD.format(detail=exc)))
             return
+        failed = None
         with self._lock:
+            # Said first: whatever happens from here, every way home lets go of every device.
+            self._grabbed = True
+            self._tick_at = self._clock()
             for path, fd in self._fds.items():
                 try:
                     self._system.grab(fd, True)
                 except OSError as exc:
-                    # Another program holds it (a remapper, say): its keys stay with that program.
-                    LOGGER.warning("Could not take %s (%s); it is left to the desktop", path, exc)
-            self._grabbed = True
+                    if exc.errno == EBUSY:
+                        # Another program holds it (a remapper, say) and the desktop gets nothing
+                        # from it either: its keys reach Beamer through that program's own device.
+                        LOGGER.info("%s is held by another program; it is left to it", path)
+                        continue
+                    failed = f"{path}: {exc}"
+                    break
+        if failed is not None:
+            # All or nothing: a keyboard left with the desktop would type here and there at once.
+            self._force_home(GRAB_FAILED.format(detail=failed))
+            return
         self._grabbed_at = now
+        # Looked at again now that nothing more reaches the desktop: a key pressed while the
+        # devices were being taken is one it saw go down.
+        for path, codes in self._held().items():
+            held.setdefault(path, set()).update(codes)
         self._held_at_grab = held
         self._flips = set()
 
-    def _let_go(self) -> None:
+    def _ungrab_all(self) -> Dict[str, int]:
+        """Let go of every device, whatever the flag says, and tell the guard there is nothing
+        left to end Beamer for. From any thread; never raises."""
         with self._lock:
             fds = dict(self._fds)
             for fd in fds.values():
                 try:
                     self._system.grab(fd, False)
-                except OSError:
+                except Exception:
                     pass
             self._grabbed = False
+            guard = self._guard
+        if guard is not None:
+            try:
+                guard.beat(False)
+            except Exception:
+                pass
+        return fds
+
+    def _let_go(self) -> None:
+        fds = self._ungrab_all()
         held, self._held_at_grab = self._held_at_grab, {}
+        # The lock keys pressed while away changed nothing the desktop knows of.
+        self._flips = set()
         self._after_grab(fds, held)
 
     def _after_grab(self, fds: Dict[str, int], held: Dict[str, Set[int]]) -> None:
@@ -620,12 +657,18 @@ class Hooks:
             except OSError:
                 continue
             for code in sorted(codes - still):
+                if code not in MODIFIER_CODES:
+                    LOGGER.warning("A key or button (%s) held when input left was let go while it was away; the "
+                                   "desktop still has it as held until it is touched once", code)
+                    continue
+                key = (devices.get(path), code)
+                # Before the tap: its press may be read back before the write of its release returns.
+                self._swallow[key] = (2, self._clock() + SWALLOW_SECONDS)
                 try:
                     self._system.tap(fd, code)
                 except OSError as exc:
+                    self._swallow.pop(key, None)
                     LOGGER.warning("Could not show the desktop that key %s was let go (%s); touch it once", code, exc)
-                    continue
-                self._swallow[(devices.get(path), code)] = (2, self._clock() + SWALLOW_SECONDS)
 
     def _force_home(self, sentence: str) -> None:
         """Let go now and say why; not grabbed again until the predicate has said input is home."""

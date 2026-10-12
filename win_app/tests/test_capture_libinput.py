@@ -30,6 +30,7 @@ class FakeSystem:
         self.denied = set()
         self.read_only = set()
         self.busy = set()
+        self.broken = set()
         self.opened = {}       # fd: (path, flags)
         self.grabs = set()     # fds grabbed now
         self.grab_log = []
@@ -64,6 +65,8 @@ class FakeSystem:
     def grab(self, fd, on):
         if on and self.path_of(fd) in self.busy:
             raise OSError(16, "Device or resource busy")
+        if on and self.path_of(fd) in self.broken:
+            raise OSError(19, "No such device")
         (self.grabs.add if on else self.grabs.discard)(fd)
         self.grab_log.append((self.path_of(fd), on))
 
@@ -330,12 +333,67 @@ class GrabTest(Rig):
         self.assertEqual(len(self.grabbed_paths()), 3)
 
     def test_a_device_another_program_holds_is_left_to_it_and_the_rest_are_taken(self):
+        # A remapper has the keyboard: the desktop gets nothing from it either.
         self.open()
-        self.system.busy = {MOUSE}
+        self.system.busy = {KEYBOARD}
+        self.away = True
+        self.turn()
+        self.assertEqual((self.grabbed_paths(), self.failures), ([MOUSE, TOUCHPAD], []))
+
+    def test_a_device_that_cannot_be_taken_for_another_reason_means_none_is(self):
+        # Taken in part, what is typed would go to the peer and to this machine's windows at once.
+        self.open()
+        self.system.broken = {MOUSE}
         self.away = True
         with self.assertLogs(capture.LOGGER, "WARNING"):
             self.turn()
-        self.assertEqual(self.grabbed_paths(), [KEYBOARD, TOUCHPAD])
+            self.turn()
+        self.assertEqual((self.grabbed_paths(), self.hooks.grabbed), ([], False))
+        self.assertEqual(len(self.failures), 1)
+        self.assertIn(MOUSE, self.sentences()[0])
+        self.assertIs(self.guards[-1].beats[-1], False)
+
+    def test_a_finger_resting_on_the_touchpad_is_not_a_key_held(self):
+        self.open()
+        self.system.down[TOUCHPAD] = {0x14A, 0x145}   # BTN_TOUCH, BTN_TOOL_FINGER
+        self.away = True
+        self.turn()
+        self.assertEqual(len(self.grabbed_paths()), 3)
+        self.system.down[TOUCHPAD] = set()
+        self.away = False
+        self.turn()
+        self.assertEqual(self.system.taps, [])
+
+    def test_the_guard_is_told_the_devices_are_free_as_soon_as_they_are(self):
+        self.open()
+        self.away = True
+        self.turn()
+        order = []
+        real = self.system.grab
+        self.system.grab = lambda fd, on: (order.append("ungrab"), real(fd, on))[1]
+        self.guards[-1].beat = lambda grabbed: order.append(("guard", grabbed))
+        self.hooks.on_failure = lambda error: order.append("app told")
+        with self.assertLogs(capture.LOGGER, "WARNING"):
+            self.hooks._force_home("a test")
+        self.assertEqual(order, ["ungrab"] * 3 + [("guard", False), "app told"])
+
+    def test_a_key_pressed_while_the_devices_were_being_taken_is_one_the_desktop_saw_go_down(self):
+        self.open()
+        real = self.system.grab
+
+        def grab(fd, on):
+            real(fd, on)
+            if on:
+                self.system.down[KEYBOARD] = {CTRL_R}
+
+        self.system.grab = grab
+        self.away = True
+        self.turn()
+        self.system.grab = real
+        self.system.down[KEYBOARD] = set()
+        self.away = False
+        self.turn()
+        self.assertEqual(self.system.taps, [(KEYBOARD, CTRL_R)])
 
     def test_a_key_that_types_is_waited_for_briefly_before_the_grab(self):
         self.open()
@@ -416,12 +474,18 @@ class HeldThroughTest(Rig):
         self.turn()
         self.assertEqual(self.system.taps, [])
 
-    def test_a_button_held_through_is_shown_released_too(self):
-        self.grab_holding(MOUSE, BTN_LEFT)
-        self.system.down[MOUSE] = set()
-        self.away = False
-        self.turn()
-        self.assertEqual(self.system.taps, [(MOUSE, BTN_LEFT)])
+    def test_only_a_modifier_is_tapped_never_a_button_or_a_key_that_types(self):
+        # A press the desktop took for a new one would be a click made or a letter typed.
+        for path, code in ((MOUSE, BTN_LEFT), (KEYBOARD, KEY_A)):
+            with self.subTest(code=code):
+                self.setUp()
+                self.grab_holding(path, code)
+                self.system.down[path] = set()
+                self.away = False
+                with self.assertLogs(capture.LOGGER, "WARNING"):
+                    self.turn()
+                self.assertEqual(self.system.taps, [])
+                self.hooks._end()
 
     def test_a_device_that_cannot_be_written_to_is_logged_and_nothing_fails(self):
         self.system.read_only = {KEYBOARD}
@@ -474,6 +538,17 @@ class WaysHomeTest(Rig):
         self.away_and_grabbed()
         self.hooks.stop()
         self.assertEqual(self.grabbed_paths(), [])
+
+    def test_every_way_out_lets_go_of_every_device_whatever_the_flag_says(self):
+        # The flag and the kernel disagreeing must never leave a device held.
+        for way in (self.hooks._end, self.hooks._let_go_from_outside, self.hooks._let_go):
+            with self.subTest(way=way.__name__):
+                self.setUp()
+                self.away_and_grabbed()
+                self.hooks._grabbed = False
+                getattr(self.hooks, way.__name__)()
+                self.assertEqual(self.grabbed_paths(), [])
+                self.hooks._end()
 
 
 class MaxSecondsTest(Rig):
@@ -635,6 +710,7 @@ class ThreadTest(Rig):
             with self.assertLogs(capture.LOGGER, "ERROR"):
                 self.contexts[-1].feed(("key", 1, 28, True))
                 self.wait(lambda: not self.system.grabs, "the watchdog")
+                self.wait(lambda: self.failures, "the app being told")
         self.assertEqual(self.sentences(), [capture.STALLED])
         # The devices are free, so the guard is told there is nothing to end Beamer for.
         self.assertIs(self.guards[-1].beats[-1], False)
@@ -648,6 +724,39 @@ class ThreadTest(Rig):
             self.wait(lambda: not self.system.grabs, "the devices let go")
             self.wait(lambda: self.failures, "the failure")
         self.assertEqual(self.rows[-1][0], "unavailable")
+
+    def test_a_key_the_app_cannot_take_is_logged_and_the_capture_goes_on(self):
+        calls = []
+
+        def on_key(*key):
+            calls.append(key)
+            if len(calls) == 1:
+                raise RuntimeError("the app tripped")
+            return True
+
+        self.hooks._on_key = on_key
+        self.hooks.start()
+        with self.assertLogs(capture.LOGGER, "ERROR"):
+            self.contexts[-1].feed(("key", 1, 28, True))
+            self.wait(lambda: calls, "the first key")
+        self.contexts[-1].feed(("key", 1, 28, False))
+        self.wait(lambda: len(calls) == 2, "the second key")
+        self.assertEqual(self.failures, [])
+
+    def test_the_watchdog_stays_free_while_the_app_is_told(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        told = threading.Event()
+        self.hooks._on_key = lambda *key: release.wait(10)
+        self.hooks.on_failure = lambda error: (told.set(), release.wait(10))  # the app's answer blocks too
+        with mock.patch.object(capture, "STALL_SECONDS", 0.2):
+            self.hooks.start()
+            self.away = True
+            self.wait(lambda: len(self.system.grabs) == 3, "the grab")
+            with self.assertLogs(capture.LOGGER, "ERROR"):
+                self.contexts[-1].feed(("key", 1, 28, True))
+                self.wait(told.is_set, "the app being told")
+            self.assertTrue(self.hooks._watchdog.is_alive())
 
     def test_an_error_in_the_loop_lets_go_and_tells_the_app(self):
         self.hooks.start()
