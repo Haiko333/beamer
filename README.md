@@ -464,6 +464,31 @@ They take two permissions, each its own udev rule, so that a machine has only th
   the portal ones wherever the desktop has the RemoteDesktop portal, as GNOME and KDE do.
 - These back ends need the `python-evdev` package and direct access to `/dev/uinput`, which the
   Flatpak does not have: run Beamer from source there (`python win_app/kvm_bridge_win.py`).
+- A firewall on the Linux machine must let in TCP 24820 for input and UDP 24821 for pairing, or
+  pairing fails. With `ufw`: `sudo ufw allow 24820/tcp` and `sudo ufw allow 24821/udp`.
+
+What has been tried on real hardware in this fork, and what only the automated tests cover. By
+desktop, for the Linux machine itself:
+
+| Desktop | Back ends | On real hardware | Notes |
+|---|---|---|---|
+| Hyprland | evdev | **Tested**: Arch Linux, a laptop with its touchpad and a French AZERTY keyboard | Edges and shortcut |
+| sway and other wlroots compositors | evdev | Not tested | Shortcut only, no edge |
+| GNOME on Wayland | portal | Not tested in this fork; upstream tested 1.5.2 on Fedora 44 | AltGr and dead keys are not typed beyond what 1.5.2 types |
+| KDE Plasma on Wayland | portal | Not tested, here or upstream | As GNOME |
+| Any desktop on X11 | x11 | Not tested, here or upstream | As GNOME |
+
+By the machine at the other end, with Hyprland on this one:
+
+| Pair | On real hardware | What was tried |
+|---|---|---|
+| Linux and Windows running upstream 1.5.2 | **Tested**, both ways | Crossing an edge and coming back, the shortcut (right Control twice), both Shift keys with Esc, AltGr (`@ # { } [ ] \| \ € ~`), dead keys (`ê ë î ï ô û`, `^x`, `¨`), the clipboard with text and with a picture |
+| Linux and Windows running this fork | Not tested | |
+| Linux and Linux | Not tested: it takes a second machine | The automated tests run both ends in one process |
+| Linux and macOS | Not tested | |
+
+Not tried on real hardware on any desktop: more than one monitor, a scaled monitor, an external
+mouse or USB keyboard, a key held as input leaves, `wtype`, and a layout other than French.
 
 Older Ubuntu and Debian releases lack the InputCapture portal, so they cannot send input out under
 Wayland; use an X11 session there. Linux does not offer gestures. KDE Plasma awaits hardware
