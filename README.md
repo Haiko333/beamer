@@ -443,9 +443,12 @@ They take two permissions, each its own udev rule, so that a machine has only th
   is meant to be run over SSH from another device the first time.
 - Tap to click is on for touchpads and natural scrolling off, whatever the compositor was told for
   its own reading of them. `BEAMER_TOUCHPAD=natural`, `notap` or `natural,notap` changes that.
-- On Hyprland the pointer crossing an edge is not wired yet; the shortcut sends input away and
-  brings it back. On sway and other compositors the shortcut is the only way, since they do not say
-  where the pointer is.
+- On Hyprland the pointer crosses an edge as on Windows and macOS, and the shortcut works too. The
+  pointer stays in sight at the edge it left while input is away. On sway and other compositors the
+  shortcut is the only way, since they do not say where the pointer is.
+- A key held as input leaves is let go for this desktop at that moment, and is not held on the
+  other machine: press it again there. That includes the way home: with a Shift held since before
+  the switch on a USB keyboard, let go of it and press both again with Esc.
 - The clipboard goes through `wl-copy` and `wl-paste` (the `wl-clipboard` package), text and
   pictures. When a machine sends text and a picture together, the text is what is set.
 - Characters are typed in the layout the compositor says it has. Set `BEAMER_XKB_LAYOUT`, for
