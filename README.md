@@ -469,6 +469,12 @@ They take two permissions, each its own udev rule, so that a machine has only th
   not the working tree. It puts the `/dev/uinput` rule in force, and leaves the `/dev/input` one in
   `/usr/share/doc/beamer` as an example to install by hand, for the reason given above; the note
   shown after installing has the commands.
+- To start Beamer with a Hyprland session, add `exec-once = beamer --hidden` to `hyprland.conf`
+  (with the Arch package; from source, the full path of the Python and of
+  `win_app/kvm_bridge_win.py` in place of `beamer`). Hyprland by itself does not run the XDG
+  autostart entry the other desktops use, and the switch on Overview stays unavailable when Beamer
+  runs from source or from this package. `--hidden` starts in the tray; where no tray is up yet,
+  the window shows.
 - A firewall on the Linux machine must let in TCP 24820 for input and UDP 24821 for pairing, or
   pairing fails. With `ufw`: `sudo ufw allow 24820/tcp` and `sudo ufw allow 24821/udp`.
 
