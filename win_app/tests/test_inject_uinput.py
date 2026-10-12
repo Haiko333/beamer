@@ -81,7 +81,17 @@ class Rig(unittest.TestCase):
 
         self._reset()
         desktop_wlroots.use(None)
-        for name, value in (("_connect", connect), ("_keymap", lambda said=None: (self.keymap, linux_layout.Names(self.layout), "a test")),
+        self.typed_out = []
+        self.has_wtype = True
+
+        def type_out(text):
+            # Never the real wtype: it would type into whatever window has the keyboard.
+            if self.has_wtype:
+                self.typed_out.append((text, tuple(sorted(inject._pressed))))
+                self.devices.events.append(("typed", text, None))
+            return self.has_wtype
+
+        for name, value in (("_connect", connect), ("_type_out", type_out), ("_keymap", lambda said=None: (self.keymap, linux_layout.Names(self.layout), "a test")),
                             ("SETTLE_SECONDS", 0.0), ("on_problem", self.said.append),
                             ("on_permission", lambda *row: self.rows.append(row))):
             patcher = mock.patch.object(inject, name, value)
@@ -179,14 +189,37 @@ class UsLayoutTest(Rig):
         inject.inject_key("ctrl", False)
         self.assertEqual(self.keys(), [(CTRL, True), (30, True), (30, False), (CTRL, False)])
 
-    def test_a_character_this_layout_has_no_key_for_is_not_typed(self):
-        import inject_x11
+    def test_a_character_this_layout_has_no_key_for_is_typed_by_wtype(self):
+        inject.inject_key("é", True, "2")
+        inject.inject_key("é", False, "2")
+        self.assertEqual(self.keys(), [])
+        self.assertEqual(self.typed_out, [("é", ())])
 
+    def test_wtype_types_with_the_peers_shift_let_go(self):
+        inject.inject_key("shift", True)
+        self.keys()
+        inject.inject_key("É", True, "2")
+        self.assertEqual(self.typed_out, [("É", ())])
+        self.assertEqual(self.keys(), [(SHIFT, False), (SHIFT, True)])
+
+    def test_with_no_wtype_a_character_with_no_key_is_not_typed_and_that_is_said_once(self):
+        self.has_wtype = False
         # Said once in the life of the process, so the saying itself is what is checked.
-        with mock.patch.object(inject_x11, "_warn_once") as warned:
+        with mock.patch.object(inject, "_warn_once") as warned:
             inject.inject_key("é", True, "2")
         self.assertEqual(self.keys(), [])
         warned.assert_called_once()
+
+    def test_text_goes_key_by_key_where_there_are_keys_and_through_wtype_where_not_in_order(self):
+        inject.inject_text("aéλb")
+        # In order: the a was down and up before wtype was asked.
+        self.assertEqual([event[1] for event in self.devices.events], [30, 30, "éλ", 48, 48])
+        self.assertEqual(self.typed_out, [("éλ", ())])
+
+    def test_right_alt_is_plain_alt_on_a_layout_with_no_third_level(self):
+        inject.inject_key("alt_r", True)
+        inject.inject_key("e", True, "e")
+        self.assertEqual(self.keys(), [(ALT_R, True), (18, True)])
 
 
 class FrenchLayoutTest(Rig):
@@ -216,6 +249,68 @@ class FrenchLayoutTest(Rig):
         self.keys()
         inject.inject_text("aé")
         self.assertEqual(self.keys(), [(CTRL, False), (16, True), (16, False), (3, True), (3, False), (CTRL, True)])
+
+    def stroke(self, code, shift=False, altgr=False):
+        """One key down and up at once, with what its level needs held round it."""
+        before = ([(SHIFT, True)] if shift else []) + ([(ALT_R, True)] if altgr else [])
+        after = ([(ALT_R, False)] if altgr else []) + ([(SHIFT, False)] if shift else [])
+        return before + [(code, True), (code, False)] + after
+
+    def test_a_third_level_character_is_typed_with_altgr_and_let_go_at_once(self):
+        # What a peer on another layout sends for these, or one that sends them as text.
+        for character, code in (("@", 11), ("#", 4), ("{", 5), ("[", 6), ("|", 7), ("\\", 9), ("]", 12), ("}", 13), ("€", 18)):
+            inject.inject_key(character, True, None)
+            self.assertEqual(self.keys(), self.stroke(code, altgr=True), character)
+            inject.inject_key(character, False, None)
+            self.assertEqual(self.keys(), [], character)
+        self.assertEqual(self.typed_out, [])
+
+    def test_a_fourth_level_character_takes_shift_and_altgr(self):
+        inject.inject_key("¿", True, None)
+        self.assertEqual(self.keys(), self.stroke(12, shift=True, altgr=True))
+
+    def test_a_character_the_layout_puts_on_a_key_no_keyboard_has_is_typed_on_one_it_has(self):
+        # xkb names a "#" key among the phone keys, far above a keyboard's; on AZERTY the one that
+        # can be pressed is AltGr+3.
+        inject.inject_key("#", True, "3")
+        self.assertEqual(self.keys(), self.stroke(4, altgr=True))
+
+    def test_the_peers_shift_is_let_go_round_a_third_level_character(self):
+        inject.inject_key("shift", True)
+        self.keys()
+        inject.inject_key("@", True, "2")  # Shift+2 on a US keyboard
+        self.assertEqual(self.keys(), [(SHIFT, False)] + self.stroke(11, altgr=True) + [(SHIFT, True)])
+
+    def test_an_accented_letter_with_no_key_is_its_dead_key_then_the_letter(self):
+        for character, strokes in (("ê", self.stroke(26) + self.stroke(18)),
+                                   ("ë", self.stroke(26, shift=True) + self.stroke(18)),
+                                   ("Ê", self.stroke(26) + self.stroke(18, shift=True)),
+                                   ("ï", self.stroke(26, shift=True) + self.stroke(23))):
+            inject.inject_key(character, True, None)
+            inject.inject_key(character, False, None)
+            self.assertEqual(self.keys(), strokes, character)
+        self.assertEqual(self.typed_out, [])
+
+    def test_an_accent_on_its_own_with_only_a_dead_key_is_that_key_then_space(self):
+        inject.inject_key("¨", True, None)
+        self.assertEqual(self.keys(), self.stroke(26, shift=True) + self.stroke(57))
+
+    def test_a_shortcut_with_a_third_level_character_still_goes_by_its_place(self):
+        inject.inject_key("ctrl", True)
+        self.keys()
+        inject.inject_key("@", True, "2")
+        self.assertEqual(self.keys(), [(3, True)])
+
+    def test_text_types_every_level_and_dead_keys_with_the_peers_modifiers_let_go(self):
+        inject.inject_key("alt_r", True)
+        self.keys()
+        inject.inject_text("a@ê")
+        self.assertEqual(self.keys(), [(ALT_R, False), (16, True), (16, False)] + self.stroke(11, altgr=True)
+                         + self.stroke(26) + self.stroke(18) + [(ALT_R, True)])
+
+    def test_a_character_on_no_key_at_any_level_goes_through_wtype(self):
+        inject.inject_key("λ", True, None)
+        self.assertEqual((self.keys(), self.typed_out), ([], [("λ", ())]))
 
 
 class LayoutTest(Rig):

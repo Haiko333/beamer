@@ -6,8 +6,7 @@ uinput and not the wlroots virtual-keyboard and virtual-pointer protocols: the k
 an ordinary keyboard and mouse to every compositor there is, GNOME and KDE included, need no
 Wayland client code, and keep working across a compositor restart. What they cost is a permission
 (a udev rule opens /dev/uinput to the person at the seat; see the README) and that the keys are
-typed in the compositor's own layout, which cannot be changed from here: a character that layout
-has no key for is not typed (logged once).
+typed in the compositor's own layout, which cannot be changed from here.
 
 Three devices, made when the app starts, since a compositor takes a moment to adopt a new device
 and the first keys sent to one it has not adopted are lost:
@@ -22,18 +21,31 @@ A character is typed as inject_x11 types it, by the same planner, over the layou
 says it has (linux_layout). Caps Lock and Num Lock are read off the virtual keyboard's own LEDs,
 which the compositor sets as it does a real keyboard's: no compositor has to be asked.
 
+Where Shift alone does not reach a character, the layout's other ways are used (xkb_levels): the
+key with AltGr, as @ and € are on a French keyboard, or a dead key and then the letter, as ê is.
+Such a key goes down and up at once: nothing is left held for a repeat or a release to find. A
+character the layout has no way to at all is handed to `wtype`, where it is installed, which types
+through the compositor's virtual-keyboard protocol with a layout of its own; with no wtype it is
+not typed, and that is logged once.
+
 Planning is pure and the devices are a seam (`_connect`), so all of it is tested with no kernel.
 python-evdev is reached only when the devices are made, so this module imports anywhere."""
 
 import functools
 import logging
+import os
+import shutil
+import subprocess
 import threading
 import time
 from typing import Callable, List, Optional, Set, Tuple
 
 from capture_x11 import LOCK_MASK, NUM_LOCK_MASK
 from inject_portal import WaylandLayout, wayland_steps
-from inject_x11 import KeyState, _warn_once, plan_key, plan_text
+from capture_x11 import KEYCODE_OFFSET
+from input_injector import CHORD_KEYS, _by_place
+from inject_x11 import NAME_TO_CODE, KeyState, _warn_once, plan_key, plan_text
+import xkb_levels
 import desktop_wlroots
 import linux_layout
 
@@ -225,6 +237,7 @@ _stopped = False
 _retrying = False
 _problem: Optional[str] = None
 _layout: Optional[WaylandLayout] = None
+_levels: Optional[xkb_levels.Levels] = None
 _names = None
 _said: Optional[dict] = None
 _said_at = 0.0
@@ -301,10 +314,10 @@ def _drop() -> None:
 
 
 def _forget_layout() -> None:
-    global _layout, _names, _said_at
+    global _layout, _levels, _names, _said_at
     if _layout is not None:
         _layout.keymap.close()
-    _layout, _names, _said_at = None, None, 0.0
+    _layout, _levels, _names, _said_at = None, None, None, 0.0
 
 
 def _forget_held() -> None:
@@ -343,7 +356,7 @@ def _typing() -> Tuple[Optional[WaylandLayout], int]:
     """(the layout to type in, its group typing now). The compositor is asked which at most once
     in LAYOUT_SECONDS, not at every character, and the layout is compiled again only when it names
     another one; one that cannot be compiled is not tried again until then either."""
-    global _layout, _names, _said, _said_at
+    global _layout, _levels, _names, _said, _said_at
     now = time.monotonic()
     if now - _said_at >= LAYOUT_SECONDS or _said_at == 0.0:
         _said, _said_at = desktop_wlroots.keyboard(KEYBOARD_NAME), now
@@ -351,13 +364,13 @@ def _typing() -> Tuple[Optional[WaylandLayout], int]:
         if wanted != _names:
             if _layout is not None:
                 _layout.keymap.close()
-            _layout, _names = None, wanted
+            _layout, _levels, _names = None, None, wanted
             try:
                 keymap, _used, origin = _keymap(said=_said)
             except Exception as exc:
                 _warn_once("Characters cannot be typed: %s", str(exc))
             else:
-                _layout = WaylandLayout(keymap)
+                _layout, _levels = _Layout(keymap), xkb_levels.Levels(keymap, _on_keyboard)
                 LOGGER.info("Typing in the keyboard layout %s, from %s", wanted.layout or "(default)", origin)
     return _layout, (_said or {}).get("group", 0)
 
@@ -437,6 +450,83 @@ def stop() -> None:
     _forget_layout()
 
 
+def _on_keyboard(keycode: int) -> bool:
+    """Below evdev's 0x100 are the keys of a keyboard; above, buttons and the keys of phones and
+    remote controls, which a layout may give a character but few programs expect one from."""
+    code = keycode - KEYCODE_OFFSET
+    return code in _KEY_SET and code < 0x100
+
+
+class _Layout(WaylandLayout):
+    """The layout's keys that the virtual keyboard has: xkb also puts characters on keys of
+    remote controls and phones (a "#" far above any keyboard's), which cannot be pressed here."""
+
+    def find(self, character: str, group: int, locks: int):
+        found = super().find(character, group, locks)
+        return found if found is not None and _on_keyboard(found[0]) else None
+
+
+SHIFT_L, ALT_GR = 42, xkb_levels.KEY_RIGHTALT
+# wtype is given this long: it types a character or a few and ends.
+WTYPE_SECONDS = 1.0
+
+
+def _type_out(text: str) -> bool:
+    """Type `text` through wtype, for what this layout has no key for. False when there is no
+    wtype or it failed. The text is one argument after `--`: nothing in it is read as an option."""
+    path = shutil.which("wtype", path="/usr/local/bin:/usr/bin:/bin")
+    if path is None or not os.environ.get("WAYLAND_DISPLAY"):
+        return False
+    try:
+        return subprocess.run([path, "--", text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=WTYPE_SECONDS).returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOGGER.warning("wtype did not type (%s)", exc)
+        return False
+
+
+def _strokes(character: str, layout, group: int, locks: int):
+    return _levels.strokes(character, group, locks, lambda wanted: layout.find(wanted, group, locks))
+
+
+def _stroke_events(strokes) -> List[Tuple[int, bool]]:
+    """Each key down and up at once with Shift and AltGr as its level needs them, nothing else
+    held: the caller has let go of what the peer holds."""
+    events: List[Tuple[int, bool]] = []
+    for keycode, shift, altgr in strokes:
+        code = keycode - KEYCODE_OFFSET
+        around = ([SHIFT_L] if shift else []) + ([ALT_GR] if altgr else [])
+        events += [(held, True) for held in around] + [(code, True), (code, False)]
+        events += [(held, False) for held in reversed(around)]
+    return events
+
+
+def _held_codes(names) -> List[int]:
+    return [NAME_TO_CODE[name] for name in sorted(names) if name in NAME_TO_CODE]
+
+
+def _beyond_shift(devices, text: str, layout, group: int, locks: int) -> None:
+    """Type `text`, none of which Shift alone reaches, with nothing of the peer's held: by the
+    layout's other levels and dead keys where it has them, and through wtype for the rest."""
+    unkeyed = ""
+
+    def flush() -> None:
+        nonlocal unkeyed
+        if unkeyed and not _type_out(unkeyed):
+            for character in unkeyed:
+                _warn_once("No key types %r in this layout, and there is no wtype to type it", character)
+        unkeyed = ""
+
+    for character in text:
+        strokes = _strokes(character, layout, group, locks)
+        if strokes is None:
+            unkeyed += character
+            continue
+        flush()
+        _press(devices, _stroke_events(strokes))
+    flush()
+
+
 @_locked
 def inject_key(name: str, down: bool, us: Optional[str] = None) -> None:
     def go(devices):
@@ -446,11 +536,28 @@ def inject_key(name: str, down: bool, us: Optional[str] = None) -> None:
             if layout is None:
                 return
             locks = devices.locks()
+            if down and name not in _state.chars_down and _beyond(name, us, layout, group, locks):
+                # A key of its own each time: a repeat is the peer's next keydown, and the release
+                # that follows finds nothing held.
+                held = _held_codes(_state.mods_down)
+                _press(devices, [(code, False) for code in held])
+                _beyond_shift(devices, name, layout, group, locks)
+                _press(devices, [(code, True) for code in held])
+                return
         steps = plan_key(name, down, us, _state, layout, group, locks)
         if steps:
             _press(devices, wayland_steps(steps))
 
     _play(go)
+
+
+def _beyond(character: str, us: Optional[str], layout, group: int, locks: int) -> bool:
+    """Whether `character` is typed by the layout's other levels, a dead key or wtype: no key
+    types it with Shift alone, and it is neither a shortcut's key nor another script's letter,
+    which go by their place on the keyboard."""
+    if _state.mods_down & CHORD_KEYS or layout.find(character, group, locks) is not None:
+        return False
+    return _by_place(character, us, _state.mods_down, lambda key: layout.place(key, group)) is None
 
 
 @_locked
@@ -459,9 +566,23 @@ def inject_text(text: str) -> None:
         layout, group = _typing()
         if layout is None:
             return
-        steps = plan_text(text, _state, layout, group, devices.locks())
-        if steps:
-            _press(devices, wayland_steps(steps))
+        locks = devices.locks()
+        # Every modifier the peer holds is let go round the whole of it (WIRE.md section 10).
+        held = _held_codes(_state.mods_down)
+        bare = KeyState()
+        bare.spares, bare.chars_down = _state.spares, _state.chars_down
+        _press(devices, [(code, False) for code in held])
+        run, keyed = "", True
+        for character in text + "\0":
+            has_key = character != "\0" and layout.find(character, group, locks) is not None
+            if run and (has_key != keyed or character == "\0"):
+                if keyed:
+                    _press(devices, wayland_steps(plan_text(run, bare, layout, group, locks)))
+                else:
+                    _beyond_shift(devices, run, layout, group, locks)
+                run = ""
+            run, keyed = run + character, has_key
+        _press(devices, [(code, True) for code in held])
 
     _play(go)
 
