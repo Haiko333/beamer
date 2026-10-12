@@ -1,2 +1,4 @@
 #!/bin/sh
+# Keeps the noise of Qt's Wayland text-input logging out of the terminal, unless the person set their own rules.
+export QT_LOGGING_RULES="${QT_LOGGING_RULES:-qt.qpa.wayland.textinput=false}"
 exec python3 /usr/share/beamer/win_app/kvm_bridge_win.py "$@"
