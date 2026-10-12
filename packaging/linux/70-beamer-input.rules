@@ -1,0 +1,17 @@
+# Beamer: let the person signed in at this seat read the keyboards, mice and touchpads of this
+# machine directly, which is how it drives another machine from a Wayland desktop with no
+# InputCapture portal to use (Hyprland, sway and the other wlroots compositors).
+#
+# Only for a machine that DRIVES others. One that is only driven needs 70-beamer-uinput.rules
+# alone, and should not have this file.
+#
+# Install:
+#   sudo install -m 644 70-beamer-input.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=input --action=change
+#
+# What this allows: every program this person runs, not Beamer alone, can then read every key
+# typed on this machine, passwords included, and take the keyboard away from the desktop. That
+# is the access a program has under X11, and more than one has under Wayland. Remove the file and
+# run the two commands again to take it back. The number must stay below 73, where systemd
+# applies the uaccess tag.
+SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess"

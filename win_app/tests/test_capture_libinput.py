@@ -1,0 +1,664 @@
+"""capture_libinput with the kernel, libinput and the guard faked: which devices are read, when
+they are grabbed and let go, each of the ways home, and what a key, a button, a move and a scroll
+become for the bridge. No device of this machine is opened."""
+
+import os
+from pathlib import Path
+import sys
+import threading
+import time
+import unittest
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+import capture_libinput as capture
+import capture_win
+import desktop_wlroots
+import linux_layout
+
+KEYBOARD, MOUSE, TOUCHPAD, OWN = "/dev/input/event3", "/dev/input/event7", "/dev/input/event9", "/dev/input/event20"
+SHIFT, SHIFT_R, CTRL_R, ESC, KEY_A, KEY_Q, CAPS = 42, 54, 97, 1, 30, 16, 58
+BTN_LEFT, BTN_SIDE = 0x110, 0x113
+
+
+class FakeSystem:
+    def __init__(self):
+        self.names = {KEYBOARD: "AT Translated Set 2 keyboard", MOUSE: "Logitech USB Receiver Mouse",
+                      TOUCHPAD: "ASUF1209:00 2808:0219 Touchpad", OWN: "Beamer virtual keyboard"}
+        self.denied = set()
+        self.read_only = set()
+        self.busy = set()
+        self.opened = {}       # fd: (path, flags)
+        self.grabs = set()     # fds grabbed now
+        self.grab_log = []
+        self.down = {}         # path: codes the kernel has as held
+        self.led = {}          # path: LEDs lit
+        self.taps = []
+        self._next = 100
+
+    def paths(self):
+        return sorted(self.names, key=lambda path: int(path.rsplit("event", 1)[1]))
+
+    def name(self, path):
+        return self.names.get(path, "")
+
+    def readable(self, path):
+        return path not in self.denied
+
+    def open(self, path, flags):
+        if path in self.denied or (path in self.read_only and flags & os.O_ACCMODE != os.O_RDONLY):
+            raise PermissionError(13, "Permission denied")
+        self._next += 1
+        self.opened[self._next] = (path, flags)
+        return self._next
+
+    def close(self, fd):
+        self.grabs.discard(fd)
+        del self.opened[fd]
+
+    def path_of(self, fd):
+        return self.opened[fd][0]
+
+    def grab(self, fd, on):
+        if on and self.path_of(fd) in self.busy:
+            raise OSError(16, "Device or resource busy")
+        (self.grabs.add if on else self.grabs.discard)(fd)
+        self.grab_log.append((self.path_of(fd), on))
+
+    def keys_down(self, fd):
+        return set(self.down.get(self.path_of(fd), ()))
+
+    def leds(self, fd):
+        return set(self.led.get(self.path_of(fd), ()))
+
+    def tap(self, fd, code):
+        if self.opened[fd][1] & os.O_ACCMODE == os.O_RDONLY:
+            raise OSError(9, "Bad file descriptor")
+        self.taps.append((self.path_of(fd), code))
+
+
+class FakeContext:
+    """libinput: a device is whatever opens and is not on `unknown`; events are queued by the test."""
+
+    def __init__(self, opener, closer, tap, natural):
+        self.opener, self.closer, self.tap, self.natural = opener, closer, tap, natural
+        self.unknown = set()
+        self.devices = {}      # device: (path, fd)
+        self.queue = []
+        self._read, self._write = os.pipe()
+        self.closed = False
+        self._next = 0
+
+    def fileno(self):
+        return self._read
+
+    def add(self, path):
+        if path in self.unknown:
+            return None
+        try:
+            fd = self.opener(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            return None
+        self._next += 1
+        self.devices[self._next] = (path, fd)
+        return self._next
+
+    def remove(self, device):
+        _path, fd = self.devices.pop(device)
+        self.closer(fd)
+
+    def feed(self, *events):
+        self.queue.extend(events)
+        os.write(self._write, b"x")
+
+    def events(self):
+        try:
+            os.set_blocking(self._read, False)
+            os.read(self._read, 4096)
+        except OSError:
+            pass
+        found, self.queue = self.queue, []
+        return found
+
+    def close(self):
+        for device in list(self.devices):
+            self.remove(device)
+        self.closed = True
+        os.close(self._read)
+        os.close(self._write)
+
+
+class FakeGuard:
+    def __init__(self):
+        self.beats = []
+        self.dead = False
+        self.closed = False
+
+    def alive(self):
+        return not self.dead
+
+    def beat(self, grabbed):
+        if self.dead:
+            raise BrokenPipeError(32, "Broken pipe")
+        self.beats.append(grabbed)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeKeymap:
+    """US, with the A key typing "q" in group 1, enough to tell a layout and a group are used."""
+
+    closed = False
+
+    def keysym(self, keycode, mods, group):
+        code = keycode - 8
+        if code == KEY_A:
+            letter = "q" if group == 1 else "a"
+            return ord(letter.upper() if bool(mods & 1) != bool(mods & 2) else letter)
+        return 0
+
+    def text(self, keysym):
+        return chr(keysym) if keysym else None
+
+    def close(self):
+        self.closed = True
+
+
+class Rig(unittest.TestCase):
+    environ = {}
+
+    def setUp(self):
+        self.system = FakeSystem()
+        self.contexts, self.guards = [], []
+        self.keys, self.mouse, self.moves, self.failures, self.rows = [], [], [], [], []
+        self.now = 1000.0
+        self.away = False
+        self.keymap = FakeKeymap()
+        self.guard_error = None
+
+        def context(*args):
+            self.contexts.append(FakeContext(*args))
+            return self.contexts[-1]
+
+        def guard():
+            if self.guard_error is not None:
+                raise self.guard_error
+            self.guards.append(FakeGuard())
+            return self.guards[-1]
+
+        self.hooks = capture.Hooks(
+            lambda *key: self.keys.append(key) or True, lambda *event: self.mouse.append(event) or True,
+            lambda dx, dy: self.moves.append((dx, dy)), system=self.system, context=context, guard=guard,
+            keymap=lambda said=None: (self.keymap, linux_layout.Names("us"), "a test"), clock=lambda: self.now,
+            environ=self.environ)
+        self.hooks.grab_while(lambda: self.away)
+        self.hooks.on_failure = self.failures.append
+        self.hooks.on_permission = lambda *row: self.rows.append(row)
+        desktop_wlroots.use(None)
+        self.addCleanup(desktop_wlroots.use, None)
+        patcher = mock.patch.object(linux_layout, "sources", lambda said=None: iter([("a test", linux_layout.Names("us"))]))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def open(self):
+        """The thread's start, without the thread: the context made and the devices found."""
+        self.hooks._context = self.hooks._context_factory(self.hooks._open, self.hooks._close, True, False)
+        self.context = self.contexts[-1]
+        self.addCleanup(self.hooks._end)
+        return self.hooks._scan()
+
+    def device(self, path):
+        return next(device for device, known in self.hooks._paths.items() if known == path)
+
+    def feed(self, *events):
+        for event in events:
+            self.hooks._handle(event)
+
+    def turn(self, seconds=0.05):
+        self.now += seconds
+        self.hooks._settle(self.now)
+
+    def grabbed_paths(self):
+        return sorted(self.system.path_of(fd) for fd in self.system.grabs)
+
+    def sentences(self):
+        return [failure.sentence for failure in self.failures]
+
+
+class DevicesTest(Rig):
+    def test_every_keyboard_and_pointer_is_read_and_beamers_own_devices_are_not(self):
+        self.assertEqual(self.open(), 0)
+        self.assertEqual(sorted(self.hooks._paths.values()), [KEYBOARD, MOUSE, TOUCHPAD])
+        self.assertNotIn(OWN, [path for path, _flags in self.system.opened.values()])
+
+    def test_what_libinput_will_not_have_is_not_asked_again_and_a_denied_one_is(self):
+        self.hooks._context = self.hooks._context_factory(self.hooks._open, self.hooks._close, True, False)
+        self.context = self.contexts[-1]
+        self.addCleanup(self.hooks._end)
+        self.context.unknown = {MOUSE}       # a lid switch, say
+        self.system.denied = {TOUCHPAD}
+        self.assertEqual(self.hooks._scan(), 1)
+        self.assertEqual(sorted(self.hooks._paths.values()), [KEYBOARD])
+        self.context.unknown = set()
+        self.system.denied = set()            # the udev rule is installed
+        self.assertEqual(self.hooks._scan(), 0)
+        self.assertEqual(sorted(self.hooks._paths.values()), [KEYBOARD, TOUCHPAD])
+
+    def test_a_device_plugged_in_is_read_and_one_taken_away_is_forgotten(self):
+        self.open()
+        self.system.names["/dev/input/event30"] = "USB Keyboard"
+        del self.system.names[MOUSE]
+        self.hooks._scan()
+        self.assertEqual(set(self.hooks._paths.values()), {KEYBOARD, TOUCHPAD, "/dev/input/event30"})
+        self.assertNotIn(MOUSE, [path for path, _flags in self.system.opened.values()])
+
+    def test_a_device_plugged_in_while_input_is_away_is_taken_with_the_others(self):
+        self.open()
+        self.away = True
+        self.turn()
+        self.system.names["/dev/input/event30"] = "USB Keyboard"
+        self.hooks._scan()
+        self.assertIn("/dev/input/event30", self.grabbed_paths())
+
+    def test_a_device_that_can_only_be_read_is_still_read(self):
+        self.system.read_only = {KEYBOARD}
+        self.open()
+        self.assertIn(KEYBOARD, self.hooks._paths.values())
+
+    def test_touchpad_options_come_from_the_environment(self):
+        self.assertEqual(capture.touchpad_options({}), (True, False))
+        self.assertEqual(capture.touchpad_options({"BEAMER_TOUCHPAD": "natural"}), (True, True))
+        self.assertEqual(capture.touchpad_options({"BEAMER_TOUCHPAD": " NoTap , natural"}), (False, True))
+        self.assertEqual(capture.max_grab_seconds({"BEAMER_GRAB_MAX_SECONDS": "5"}), 5.0)
+        for raw in ("", "0", "-3", "soon"):
+            self.assertIsNone(capture.max_grab_seconds({"BEAMER_GRAB_MAX_SECONDS": raw}))
+
+
+class GrabTest(Rig):
+    def test_the_devices_are_grabbed_while_input_is_away_and_only_then(self):
+        self.open()
+        self.turn()
+        self.assertEqual((self.grabbed_paths(), self.hooks.grabbed, self.guards), ([], False, []))
+        self.away = True
+        self.turn()
+        self.assertEqual((self.grabbed_paths(), self.hooks.grabbed), ([KEYBOARD, MOUSE, TOUCHPAD], True))
+        self.away = False
+        self.turn()
+        self.assertEqual((self.grabbed_paths(), self.hooks.grabbed), ([], False))
+
+    def test_the_guard_is_told_before_the_first_device_is_taken(self):
+        self.open()
+        order = []
+        real = self.system.grab
+        self.system.grab = lambda fd, on: (order.append("grab"), real(fd, on))[1]
+
+        def guard():
+            made = FakeGuard()
+            made.beat = lambda grabbed: order.append(("guard", grabbed))
+            return made
+
+        self.hooks._guard_factory = guard
+        self.away = True
+        self.turn()
+        self.assertEqual(order[0], ("guard", True))
+        self.assertEqual(order.count("grab"), 3)
+
+    def test_without_a_guard_the_keyboard_is_not_taken_and_input_comes_home(self):
+        self.open()
+        self.guard_error = OSError("no interpreter")
+        self.away = True
+        with self.assertLogs(capture.LOGGER, "ERROR"):
+            self.turn()
+            self.turn()
+        self.assertEqual(self.grabbed_paths(), [])
+        self.assertEqual(len(self.failures), 1)
+        self.assertIn("guard", self.sentences()[0])
+
+    def test_a_guard_that_died_is_replaced_before_the_next_grab(self):
+        self.open()
+        self.away = True
+        self.turn()
+        self.away = False
+        self.turn()
+        self.guards[0].dead = True
+        self.away = True
+        self.turn()
+        self.assertEqual((len(self.guards), self.guards[0].closed, self.guards[1].beats), (2, True, [True]))
+        self.assertEqual(len(self.grabbed_paths()), 3)
+
+    def test_a_device_another_program_holds_is_left_to_it_and_the_rest_are_taken(self):
+        self.open()
+        self.system.busy = {MOUSE}
+        self.away = True
+        with self.assertLogs(capture.LOGGER, "WARNING"):
+            self.turn()
+        self.assertEqual(self.grabbed_paths(), [KEYBOARD, TOUCHPAD])
+
+    def test_a_key_that_types_is_waited_for_briefly_before_the_grab(self):
+        self.open()
+        self.system.down[KEYBOARD] = {KEY_A}
+        self.away = True
+        self.turn(0.1)
+        self.assertEqual(self.grabbed_paths(), [])
+        self.system.down[KEYBOARD] = set()
+        self.turn(0.1)
+        self.assertEqual(len(self.grabbed_paths()), 3)
+
+    def test_a_key_never_let_go_does_not_hold_the_grab_off_for_ever(self):
+        self.open()
+        self.system.down[KEYBOARD] = {KEY_A}
+        self.away = True
+        self.turn(0.1)
+        self.turn(capture.GRAB_WAIT_SECONDS)
+        self.assertEqual(len(self.grabbed_paths()), 3)
+
+    def test_a_modifier_held_is_not_waited_for(self):
+        self.open()
+        self.system.down[KEYBOARD] = {CTRL_R}   # the shortcut's own key, in the hold style
+        self.away = True
+        self.turn()
+        self.assertEqual(len(self.grabbed_paths()), 3)
+
+
+class HeldThroughTest(Rig):
+    """A key held when the grab is taken and let go during it: the desktop never saw the release."""
+
+    def grab_holding(self, path, code):
+        self.open()
+        self.system.down[path] = {code}
+        self.feed(("key", self.device(path), code, True))
+        self.away = True
+        self.turn()
+        self.turn(capture.GRAB_WAIT_SECONDS)  # a button is waited for as a key that types is
+        self.assertTrue(self.hooks.grabbed)
+        self.keys.clear()
+
+    def test_the_desktop_is_shown_the_release_when_the_grab_ends(self):
+        self.grab_holding(KEYBOARD, CTRL_R)
+        self.system.down[KEYBOARD] = set()
+        self.feed(("key", self.device(KEYBOARD), CTRL_R, False))
+        self.away = False
+        self.turn()
+        self.assertEqual(self.system.taps, [(KEYBOARD, CTRL_R)])
+        # The tap is ungrabbed first: grabbed, it would come back to Beamer alone.
+        self.assertEqual(self.grabbed_paths(), [])
+
+    def test_beamers_own_tap_is_not_taken_for_the_user_pressing_the_key(self):
+        self.grab_holding(KEYBOARD, CTRL_R)
+        self.system.down[KEYBOARD] = set()
+        self.feed(("key", self.device(KEYBOARD), CTRL_R, False))
+        self.away = False
+        self.turn()
+        self.keys.clear()
+        device = self.device(KEYBOARD)
+        self.feed(("key", device, CTRL_R, True), ("key", device, CTRL_R, False))
+        self.assertEqual(self.keys, [])
+        # The next press is the user's.
+        self.feed(("key", device, CTRL_R, True))
+        self.assertEqual([key[:3] for key in self.keys], [("cmd_r", True, CTRL_R)])
+
+    def test_a_tap_that_never_comes_back_does_not_eat_a_later_press(self):
+        self.grab_holding(KEYBOARD, CTRL_R)
+        self.system.down[KEYBOARD] = set()
+        self.away = False
+        self.turn()
+        self.keys.clear()
+        self.now += capture.SWALLOW_SECONDS + 0.1
+        self.feed(("key", self.device(KEYBOARD), CTRL_R, True))
+        self.assertEqual(len(self.keys), 1)
+
+    def test_a_key_still_held_when_the_grab_ends_is_left_alone(self):
+        self.grab_holding(KEYBOARD, CTRL_R)
+        self.away = False
+        self.turn()
+        self.assertEqual(self.system.taps, [])
+
+    def test_a_button_held_through_is_shown_released_too(self):
+        self.grab_holding(MOUSE, BTN_LEFT)
+        self.system.down[MOUSE] = set()
+        self.away = False
+        self.turn()
+        self.assertEqual(self.system.taps, [(MOUSE, BTN_LEFT)])
+
+    def test_a_device_that_cannot_be_written_to_is_logged_and_nothing_fails(self):
+        self.system.read_only = {KEYBOARD}
+        self.grab_holding(KEYBOARD, CTRL_R)
+        self.system.down[KEYBOARD] = set()
+        self.away = False
+        with self.assertLogs(capture.LOGGER, "WARNING"):
+            self.turn()
+        self.assertEqual(self.system.taps, [])
+
+
+class WaysHomeTest(Rig):
+    def away_and_grabbed(self):
+        self.open()
+        self.away = True
+        self.turn()
+        self.assertTrue(self.hooks.grabbed)
+
+    def test_both_shifts_and_esc_let_go_at_once_and_say_so(self):
+        self.away_and_grabbed()
+        device = self.device(KEYBOARD)
+        with self.assertLogs(capture.LOGGER, "WARNING"):
+            self.feed(("key", device, SHIFT, True), ("key", device, SHIFT_R, True), ("key", device, ESC, True))
+        self.assertEqual((self.grabbed_paths(), self.sentences()), ([], [capture.PANIC]))
+        # The app has not brought input home yet: the devices are not taken again meanwhile.
+        self.turn()
+        self.assertEqual(self.grabbed_paths(), [])
+        self.away = False
+        self.turn()
+        self.away = True
+        self.turn()
+        self.assertEqual(len(self.grabbed_paths()), 3)
+
+    def test_the_chord_is_only_a_chord_while_input_is_away(self):
+        self.open()
+        device = self.device(KEYBOARD)
+        self.feed(("key", device, SHIFT, True), ("key", device, SHIFT_R, True), ("key", device, ESC, True))
+        self.assertEqual(self.failures, [])
+        self.assertEqual(self.keys[-1][:2], ("esc", True))
+
+    def test_the_chord_works_across_two_keyboards(self):
+        self.system.names["/dev/input/event30"] = "USB Keyboard"
+        self.away_and_grabbed()
+        with self.assertLogs(capture.LOGGER, "WARNING"):
+            self.feed(("key", self.device(KEYBOARD), SHIFT, True), ("key", self.device("/dev/input/event30"), SHIFT_R, True),
+                      ("key", self.device(KEYBOARD), ESC, True))
+        self.assertEqual(self.grabbed_paths(), [])
+
+    def test_stop_lets_go(self):
+        self.away_and_grabbed()
+        self.hooks.stop()
+        self.assertEqual(self.grabbed_paths(), [])
+
+
+class MaxSecondsTest(Rig):
+    environ = {"BEAMER_GRAB_MAX_SECONDS": "5"}
+
+    def test_the_grab_ends_after_the_time_given_whatever_the_app_says(self):
+        self.open()
+        self.away = True
+        self.turn()
+        self.turn(4.0)
+        self.assertEqual(len(self.grabbed_paths()), 3)
+        with self.assertLogs(capture.LOGGER, "WARNING"):
+            self.turn(1.0)
+        self.assertEqual(self.grabbed_paths(), [])
+        self.assertEqual(self.sentences(), [capture.TOO_LONG.format(seconds=5.0)])
+        self.turn(10.0)
+        self.assertEqual(self.grabbed_paths(), [])
+
+
+class EventsTest(Rig):
+    def test_a_named_key_and_a_character_reach_the_bridge_as_x11s_do(self):
+        self.open()
+        device = self.device(KEYBOARD)
+        self.feed(("key", device, 28, True), ("key", device, 28, False), ("key", device, KEY_A, True), ("key", device, KEY_A, False))
+        self.assertEqual(self.keys, [("enter", True, 28, None), ("enter", False, 28, None),
+                                     ("a", True, KEY_A, "a"), ("a", False, KEY_A, "a")])
+
+    def test_shift_and_caps_lock_make_a_capital_and_the_release_names_the_same_key(self):
+        self.open()
+        device = self.device(KEYBOARD)
+        self.feed(("key", device, SHIFT, True), ("key", device, KEY_A, True), ("key", device, SHIFT, False), ("key", device, KEY_A, False))
+        self.assertEqual([key[0] for key in self.keys], ["shift", "A", "shift", "A"])
+        self.keys.clear()
+        self.system.led[KEYBOARD] = {capture.LED_CAPSL}
+        self.feed(("key", device, KEY_A, True))
+        self.assertEqual(self.keys[0][0], "A")
+
+    def test_caps_lock_pressed_while_away_counts_though_no_led_shows_it(self):
+        self.open()
+        device = self.device(KEYBOARD)
+        self.away = True
+        self.turn()
+        self.feed(("key", device, CAPS, True), ("key", device, CAPS, False), ("key", device, KEY_A, True), ("key", device, KEY_A, False))
+        self.assertEqual(self.keys[-1][0], "A")
+        # Home again, the LED is the truth once more.
+        self.away = False
+        self.turn()
+        self.away = True
+        self.turn()
+        self.feed(("key", device, KEY_A, True))
+        self.assertEqual(self.keys[-1][0], "a")
+
+    def test_the_layout_and_its_group_are_the_ones_the_compositor_names_for_that_keyboard(self):
+        self.open()
+        asked = []
+        with mock.patch.object(desktop_wlroots, "keyboard", lambda name: asked.append(name) or {"layout": "us,fr", "group": 1}):
+            self.feed(("key", self.device(KEYBOARD), KEY_A, True))
+            self.feed(("key", self.device(KEYBOARD), KEY_A, False), ("key", self.device(KEYBOARD), KEY_A, True))
+        self.assertEqual((self.keys[0][0], asked), ("q", ["AT Translated Set 2 keyboard"]))
+
+    def test_a_key_that_types_nothing_and_a_layout_that_cannot_be_read_send_nothing(self):
+        self.open()
+        self.feed(("key", self.device(KEYBOARD), KEY_Q, True))
+        self.assertEqual(self.keys, [])
+        self.hooks._keymap_factory = mock.Mock(side_effect=RuntimeError("no libxkbcommon"))
+        self.hooks._names = None
+        self.hooks._said_at = 0.0
+        with mock.patch.object(linux_layout, "sources", lambda said=None: iter([("a test", linux_layout.Names("zz"))])), \
+                self.assertLogs(capture.LOGGER, "ERROR"):
+            self.feed(("key", self.device(KEYBOARD), KEY_A, True), ("key", self.device(KEYBOARD), KEY_A, False))
+        self.assertEqual(self.keys, [])
+        self.feed(("key", self.device(KEYBOARD), 28, True))
+        self.assertEqual(self.keys[0][0], "enter")
+
+    def test_buttons_are_the_bridges_mouse_messages(self):
+        self.open()
+        device = self.device(MOUSE)
+        self.feed(("button", device, BTN_LEFT, True), ("button", device, BTN_LEFT, False), ("button", device, BTN_SIDE, True),
+                  ("button", device, 0x120, True))
+        self.assertEqual([capture_win.mouse_event(message, data) for message, _x, _y, data in self.mouse],
+                         [("button", "left", True), ("button", "left", False), ("button", "back", True)])
+
+    def test_moves_are_beamers_only_while_input_is_away_and_fractions_add_up(self):
+        self.open()
+        device = self.device(TOUCHPAD)
+        self.feed(("motion", device, 5.0, 5.0))
+        self.assertEqual(self.moves, [])
+        self.away = True
+        self.turn()
+        self.feed(("motion", device, 0.4, -0.4), ("motion", device, 0.4, -0.4), ("motion", device, 0.4, -0.4), ("motion", device, 3.0, 0.0))
+        self.assertEqual(self.moves, [(1, -1), (3, 0)])
+
+    def test_a_wheel_click_and_two_fingers_on_a_touchpad_scroll_the_same_way(self):
+        self.open()
+        # libinput: positive is down and right. A click down, then right.
+        self.feed(("wheel", self.device(MOUSE), 120.0, 0.0), ("wheel", self.device(MOUSE), 0.0, 120.0))
+        self.assertEqual([capture_win.mouse_event(message, data) for message, _x, _y, data in self.mouse],
+                         [("wheel", -1.0, 0.0), ("wheel", 0.0, 1.0)])
+        self.mouse.clear()
+        # Two fingers: a third of a click at a time, upwards.
+        for _ in range(3):
+            self.feed(("scroll", self.device(TOUCHPAD), -capture.SCROLL_PER_CLICK / 3, 0.0))
+        total = sum(capture_win.mouse_event(message, data)[1] for message, _x, _y, data in self.mouse)
+        self.assertAlmostEqual(total, 1.0, places=1)
+
+
+class ThreadTest(Rig):
+    def wait(self, condition, what):
+        deadline = time.monotonic() + 3
+        while not condition():
+            self.assertLess(time.monotonic(), deadline, what)
+            time.sleep(0.005)
+
+    def setUp(self):
+        super().setUp()
+        self.hooks._clock = time.monotonic
+        self.addCleanup(self.hooks.stop)
+
+    def test_start_reads_the_devices_and_says_ready_and_stop_closes_everything(self):
+        self.hooks.start()
+        self.assertEqual(self.rows, [("ready", "", False)])
+        context = self.contexts[-1]
+        context.feed(("key", 1, 28, True))
+        self.wait(lambda: self.keys, "the key")
+        self.away = True
+        self.wait(lambda: len(self.system.grabs) == 3, "the grab")
+        self.wait(lambda: self.guards and self.guards[-1].beats.count(True) >= 2, "the guard's beats")
+        self.hooks.stop()
+        self.assertEqual((self.system.grabs, self.system.opened, context.closed, self.guards[-1].closed), (set(), {}, True, True))
+
+    def test_no_permission_fails_the_start_with_the_sentence_and_ask_again_tries_again(self):
+        self.system.denied = set(self.system.names)
+        with self.assertRaises(capture.CaptureUnavailable) as raised:
+            self.hooks.start()
+        self.assertEqual(raised.exception.sentence, capture.NO_ACCESS)
+        self.assertEqual(self.rows, [("unavailable", capture.NO_ACCESS, True)])
+        self.system.denied = set()
+        self.hooks.request_again()
+        self.assertEqual(self.rows[-1], ("ready", "", False))
+
+    def test_a_machine_with_no_device_at_all_and_one_without_libinput_say_so(self):
+        self.system.names = {OWN: "Beamer virtual keyboard"}
+        with self.assertRaises(capture.CaptureUnavailable) as raised:
+            self.hooks.start()
+        self.assertEqual(raised.exception.sentence, capture.NO_DEVICES)
+        self.hooks._context_factory = mock.Mock(side_effect=RuntimeError("libinput is not installed"))
+        with self.assertRaises(capture.CaptureUnavailable) as raised:
+            self.hooks.start()
+        self.assertIn("libinput is not installed", raised.exception.sentence)
+
+    def test_a_stalled_capture_thread_has_the_devices_let_go_by_the_watchdog(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.hooks._on_key = lambda *key: release.wait(10)  # a callback that never returns
+        with mock.patch.object(capture, "STALL_SECONDS", 0.2):
+            self.hooks.start()
+            self.away = True
+            self.wait(lambda: len(self.system.grabs) == 3, "the grab")
+            with self.assertLogs(capture.LOGGER, "ERROR"):
+                self.contexts[-1].feed(("key", 1, 28, True))
+                self.wait(lambda: not self.system.grabs, "the watchdog")
+        self.assertEqual(self.sentences(), [capture.STALLED])
+        # The devices are free, so the guard is told there is nothing to end Beamer for.
+        self.assertIs(self.guards[-1].beats[-1], False)
+
+    def test_a_guard_that_dies_while_the_devices_are_held_ends_the_capture_and_lets_go(self):
+        self.hooks.start()
+        self.away = True
+        self.wait(lambda: len(self.system.grabs) == 3, "the grab")
+        with self.assertLogs(capture.LOGGER, "ERROR"):
+            self.guards[-1].dead = True
+            self.wait(lambda: not self.system.grabs, "the devices let go")
+            self.wait(lambda: self.failures, "the failure")
+        self.assertEqual(self.rows[-1][0], "unavailable")
+
+    def test_an_error_in_the_loop_lets_go_and_tells_the_app(self):
+        self.hooks.start()
+        self.away = True
+        self.wait(lambda: len(self.system.grabs) == 3, "the grab")
+        with self.assertLogs(capture.LOGGER, "ERROR"):
+            self.contexts[-1].events = mock.Mock(side_effect=RuntimeError("libinput broke"))
+            self.wait(lambda: self.failures, "the failure")
+        self.assertEqual(self.system.grabs, set())
+        self.assertIn("libinput broke", self.sentences()[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

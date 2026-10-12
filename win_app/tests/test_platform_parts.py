@@ -65,9 +65,8 @@ class LoadTest(unittest.TestCase):
         self.assertEqual([portal.capture.__name__, portal.injector.__name__, portal.clipboard.__name__, portal.desktop.__name__],
                          ["capture_portal", "inject_portal", "clipboard_portal", "desktop_portal"])
         evdev = platform_parts.load("linux", {"XDG_SESSION_TYPE": "wayland"}, lambda: HYPRLAND)
-        self.assertEqual([evdev.injector.__name__, evdev.clipboard.__name__, evdev.desktop.__name__],
-                         ["inject_uinput", "clipboard_wl", "desktop_wlroots"])
-        self.assertNotIn("portal", evdev.capture.__name__)
+        self.assertEqual([evdev.capture.__name__, evdev.injector.__name__, evdev.clipboard.__name__, evdev.desktop.__name__],
+                         ["capture_libinput", "inject_uinput", "clipboard_wl", "desktop_wlroots"])
 
     def test_every_capture_part_has_what_the_shell_and_the_settings_read(self):
         for portals in (lambda: GNOME, lambda: HYPRLAND):
@@ -76,20 +75,6 @@ class LoadTest(unittest.TestCase):
                          "VK_TO_NAME", "NOT_TRIGGER_VKS", "VK_TITLES", "UNRECORDABLE_TRIGGER_VKS"):
                 with self.subTest(capture=capture.__name__, name=name):
                     self.assertTrue(hasattr(capture, name))
-
-
-class AbsentCaptureTest(unittest.TestCase):
-    def test_hooks_that_cannot_start_say_so_in_the_permission_row_and_fail_with_the_sentence(self):
-        import capture_absent
-
-        said = []
-        hooks = capture_absent.Hooks(lambda *_: False, lambda *_: False, lambda *_: None)
-        hooks.on_permission = lambda *row: said.append(row)
-        with self.assertRaises(capture_absent.CaptureUnavailable) as raised:
-            hooks.start()
-        self.assertEqual(said, [("unavailable", capture_absent.NO_CAPTURE, False)])
-        self.assertEqual(raised.exception.sentence, capture_absent.NO_CAPTURE)
-        hooks.stop()
 
 
 if __name__ == "__main__":

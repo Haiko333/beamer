@@ -423,13 +423,29 @@ On Wayland, the desktop limits what Beamer can do:
   machines still show theirs.”
 
 On a Wayland desktop with no RemoteDesktop portal, which is Hyprland, sway and the other wlroots
-compositors, Beamer uses back ends that need no portal (this is work in progress in this fork, and
-at this stage such a machine can be driven but cannot yet drive another):
+compositors, Beamer uses back ends that need no portal (this is work in progress in this fork).
+They take two permissions, each its own udev rule, so that a machine has only the one it needs:
 
-- Keys, the pointer and the wheel are played through a virtual keyboard and mouse made with
-  `/dev/uinput`. Install [`packaging/linux/70-beamer-uinput.rules`](packaging/linux/70-beamer-uinput.rules)
+- **To be driven**: keys, the pointer and the wheel are played through a virtual keyboard and mouse
+  made with `/dev/uinput`. Install [`packaging/linux/70-beamer-uinput.rules`](packaging/linux/70-beamer-uinput.rules)
   as its first lines say. It opens `/dev/uinput` to the person signed in at the machine, and so to
-  every program they run, not to Beamer alone.
+  every program they run, not to Beamer alone: any of them can then type and click as that person.
+- **To drive another machine**: Beamer reads the keyboards, mice and touchpads in `/dev/input`
+  through libinput, and grabs them while input is away. Install
+  [`packaging/linux/70-beamer-input.rules`](packaging/linux/70-beamer-input.rules) as its first lines
+  say, on a machine that drives others and only there. It opens `/dev/input` to the person signed in,
+  and so to every program they run: any of them can then read every key typed on the machine,
+  passwords included. A machine that is only driven should not have this rule.
+- While Beamer holds the keyboard there are three ways home that do not depend on it working: both
+  Shift keys with Esc let go at once; a watchdog lets go when Beamer's capture stops answering; and a
+  second process ends Beamer if it hangs altogether, which gives the keyboard back, since the grab
+  is the kernel's and ends with the process. `tools/grab_probe.py` tries each of these by hand, and
+  is meant to be run over SSH from another device the first time.
+- Tap to click is on for touchpads and natural scrolling off, whatever the compositor was told for
+  its own reading of them. `BEAMER_TOUCHPAD=natural`, `notap` or `natural,notap` changes that.
+- On Hyprland the pointer crossing an edge is not wired yet; the shortcut sends input away and
+  brings it back. On sway and other compositors the shortcut is the only way, since they do not say
+  where the pointer is.
 - The clipboard goes through `wl-copy` and `wl-paste` (the `wl-clipboard` package), text and
   pictures. When a machine sends text and a picture together, the text is what is set.
 - Characters are typed in the layout the compositor says it has. Set `BEAMER_XKB_LAYOUT`, for

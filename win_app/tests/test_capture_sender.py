@@ -45,6 +45,11 @@ def check_linux_key(capture, session, code, name, us):
 
         def feed(down):
             hooks._key(code + 8, down, 0, 0, True)
+    elif session == "evdev":
+        hooks._keymap_factory = lambda said=None: (Keymap(), None, "a test")
+
+        def feed(down):
+            hooks._key(1, code, down)
     else:
         hooks._keymap = Keymap()
         device = object()
@@ -63,7 +68,9 @@ def check_linux_key(capture, session, code, name, us):
 
 class CaptureSenderTests(unittest.TestCase):
     def check_backend(self, session):
-        capture = platform_parts.load("linux", {"XDG_SESSION_TYPE": session, "BEAMER_BACKEND": "portal"}).capture
+        environ = {"XDG_SESSION_TYPE": "wayland", "BEAMER_BACKEND": "evdev"} if session == "evdev" else {
+            "XDG_SESSION_TYPE": session, "BEAMER_BACKEND": "portal"}
+        capture = platform_parts.load("linux", environ).capture
         with mock.patch.object(kvm_bridge_win, "capture_win", capture), mock.patch.object(sender, "OWN_PLATFORM", "linux"):
             for code, name, us in ((30, "a", "a"), (28, "enter", None), (42, "shift", None)):
                 with self.subTest(key=name):
@@ -74,6 +81,15 @@ class CaptureSenderTests(unittest.TestCase):
 
     def test_wayland_capture_key_press_and_release_reach_sender(self):
         self.check_backend("wayland")
+
+    def test_evdev_capture_key_press_and_release_reach_sender(self):
+        import desktop_wlroots
+        import linux_layout
+
+        desktop_wlroots.use(None)
+        self.addCleanup(desktop_wlroots.use, None)
+        with mock.patch.object(linux_layout, "sources", lambda said=None: iter([("a test", linux_layout.Names("us"))])):
+            self.check_backend("evdev")
 
     def test_windows_dead_key_and_composed_text_still_reach_sender(self):
         rig = Rig()

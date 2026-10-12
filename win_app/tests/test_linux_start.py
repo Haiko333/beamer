@@ -156,12 +156,32 @@ def evdev_child(config: Path) -> None:
     inject_uinput._connect = no_devices
     desktop_wlroots.use(None)
 
+    import capture_libinput
+
+    class NoInput(capture_libinput.System):
+        """A machine whose /dev/input is closed to this user: no device of the real one is opened."""
+
+        def paths(self):
+            return ["/dev/input/event0"]
+
+        def name(self, path):
+            return "A keyboard"
+
+        def readable(self, path):
+            return False
+
+        def open(self, path, flags):
+            raise PermissionError(13, "Permission denied")
+
+    capture_libinput.System = NoInput
+
     import kvm_bridge_win
     import platform_parts
 
     assert platform_parts.BACKEND == "evdev" and platform_parts.WAYLAND is True and platform_parts.PORTAL is False
-    assert [platform_parts.injector.__name__, platform_parts.clipboard.__name__, platform_parts.desktop.__name__,
-            platform_parts.autostart.__name__] == ["inject_uinput", "clipboard_wl", "desktop_wlroots", "autostart_x11"]
+    assert [platform_parts.capture.__name__, platform_parts.injector.__name__, platform_parts.clipboard.__name__,
+            platform_parts.desktop.__name__, platform_parts.autostart.__name__] == [
+        "capture_libinput", "inject_uinput", "clipboard_wl", "desktop_wlroots", "autostart_x11"]
     app = QApplication([])
     window = kvm_bridge_win.WindowsApplication(config)
     told = []
@@ -187,6 +207,18 @@ def evdev_child(config: Path) -> None:
     assert window.server._can_inject() is False
     app.processEvents()
     assert told, "the receiver was not told that this machine can no longer be driven"
+    # The capture is wired as X11's is: the devices are held for as long as input is away, the
+    # shortcut may send it away, and a machine that may not read /dev/input says so in its row.
+    assert window.hooks._predicate is not None and window.hooks._predicate() is False
+    assert window.hooks.on_failure is not None and window.sender.input_held() is True
+    try:
+        window.hooks.start()
+        raise AssertionError("the capture started with no device it may read")
+    except capture_libinput.CaptureUnavailable as unavailable:
+        assert "70-beamer-input.rules" in unavailable.sentence
+    status, detail = window.permission_state.status("capture")
+    assert status == "unavailable" and "udev rule" in detail, (status, detail)
+    assert window.permission_state.can_ask_again("capture")
     # A peer's input with no devices is dropped, not raised into the link.
     platform_parts.injector.inject_key("a", True, "a")
     platform_parts.injector.inject_mouse_move(1, 1)
