@@ -34,6 +34,12 @@ is better than Beamer saying it has. A keyboard that repeats a held key itself (
 then presses it again as far as the kernel can tell: that press and its release are the old hold
 still, and go to nobody. Whoever holds a key across the switch presses it again on the other side.
 
+A character key is named by what the layout types with Shift, as capture_x11 names it. For a
+peer that types `text` (the bridge says, through `text_while`), what AltGr reaches and what a dead
+key and a letter make go as text instead: @ and € on AZERTY, ê and ë. Otherwise AltGr and the
+key travel as the two keys they are, which only a peer with the same layout types alike, and a
+dead key types nothing. A shortcut is never text.
+
 The devices, the guard and libinput are seams, so everything but the kernel's part is tested
 without a keyboard. Nothing here is imported until the hooks start, so this module imports anywhere."""
 
@@ -66,6 +72,7 @@ from capture_win import (  # noqa: F401  (re-exported for the bridge, which read
 )
 from capture_x11 import (  # noqa: F401  (the same evdev names and titles as X11)
     _BUTTONS,
+    CHORD_MASK,
     KEYCODE_OFFSET,
     LOCK_MASK,
     NOT_TRIGGER_VKS,
@@ -79,9 +86,11 @@ from capture_x11 import (  # noqa: F401  (the same evdev names and titles as X11
     input_title,
 )
 from core import keytable
+from core.capture_types import TextInput  # noqa: F401  (read from here by the tests)
 import desktop_wlroots
 import grab_guard
 import linux_layout
+import xkb_levels
 
 LOGGER = logging.getLogger(__name__)
 
@@ -97,8 +106,10 @@ SCAN_SECONDS = 2.0
 # not left repeating it; then it is taken anyway.
 GRAB_WAIT_SECONDS = 0.5
 # How long after Beamer let go of a held key for the desktop a new press of it is still that same
-# hold, said again by a keyboard that repeats its keys itself (a second at most before the first).
-GHOST_SECONDS = 1.5
+# hold, said again by a keyboard that repeats its keys itself (a quarter of a second before the
+# first as Linux sets a PS/2 keyboard, a thirtieth between the rest). Kept short: until then a
+# press of that key by a finger that let go and came back is taken for the same.
+GHOST_SECONDS = 0.5
 # How long what the compositor said of the keyboard layout is gone by.
 LAYOUT_SECONDS = 1.0
 # libinput's scroll units for one click of a wheel.
@@ -114,6 +125,9 @@ HELD_MODS = {42: 1, 54: 1, 29: 4, 97: 4, 56: 8, 125: 64, 126: 64}
 # Keys a grab does not wait for: they type nothing, and the shortcut's own are among them.
 MODIFIER_CODES = frozenset(HELD_MODS) | {100}
 KEY_ESC, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_CAPSLOCK, KEY_NUMLOCK = 1, 42, 54, 58, 69
+KEY_SPACE, KEY_RIGHTALT = xkb_levels.KEY_SPACE, xkb_levels.KEY_RIGHTALT
+# In place of a name for a key that went as text: its release tells the bridge nothing.
+_AS_TEXT = object()
 PANIC_CHORD = frozenset({KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_ESC})
 # What the kernel lists as held that matters to a grab: a keyboard's keys and a mouse's buttons. A
 # touchpad lists a resting finger as held too (BTN_TOUCH, BTN_TOOL_FINGER), which is neither.
@@ -280,6 +294,7 @@ class Hooks:
         # Whether a move made at home is told: by default, where the compositor says where the
         # pointer is. tools/grab_probe.py, which only counts, has every one.
         self.home_moves: Optional[Callable[[], bool]] = None
+        self._types_text: Optional[Callable[[], bool]] = None
         self._thread: Optional[threading.Thread] = None
         self._watchdog: Optional[threading.Thread] = None
         self._stopping = threading.Event()
@@ -312,6 +327,7 @@ class Hooks:
         self._names = None
         self._said: Optional[dict] = None
         self._said_at = 0.0
+        self._dead: Optional[int] = None  # a dead key's keysym, waiting for its letter
         self._carry = [0.0, 0.0]
         self._home_motion_at = 0.0
         self._scroll_carry = [0.0, 0.0]
@@ -326,6 +342,10 @@ class Hooks:
 
     def grab_while(self, predicate: Callable[[], bool]) -> None:
         self._predicate = predicate
+
+    def text_while(self, predicate: Callable[[], bool]) -> None:
+        """`predicate()` says whether the machine input is on types `text`."""
+        self._types_text = predicate
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -530,8 +550,12 @@ class Hooks:
 
     def _forget(self, device: int) -> None:
         self._paths.pop(device, None)
-        for key in [key for key in self._down if key[0] == device]:
-            self._down.discard(key)
+        for held in (self._down, self._ghost_down):
+            for key in [key for key in held if key[0] == device]:
+                held.discard(key)
+        for noted in (self._names_down, self._ghosts):
+            for key in [key for key in noted if key[0] == device]:
+                del noted[key]
         try:
             self._context.remove(device)
         except Exception:
@@ -597,6 +621,10 @@ class Hooks:
             self._refused = True
             self._fail(CaptureUnavailable(NO_GUARD.format(detail=exc)))
             return
+        # Nothing of the last time away is carried into this one, whichever way it ended.
+        self._ghosts.clear()
+        self._ghost_down.clear()
+        self._dead = None
         # Before anything is taken: what is held is let go where the desktop still reads it.
         self._release(held)
         failed = None
@@ -642,33 +670,41 @@ class Hooks:
                     LOGGER.warning("%s is read only (%s): a key or button held on it as input left cannot be shown "
                                    "as let go, and the desktop may repeat it until it is touched again", path, exc)
                     break
-                self._ghosts[(devices.get(path), code)] = until
+                if code in _KEYBOARD_CODES:  # a mouse never says again that its button is held
+                    self._ghosts[(devices.get(path), code)] = until
 
     def _release_again(self, taken: Set[str]) -> Optional[str]:
         """Ask the kernel, now that nothing more reaches the desktop, whether anything is held
         after all: a key that went down while the devices were being taken, which the desktop saw.
         Its device is given back for the moment it takes to write the release. Returns what went
         wrong when a device could not be taken again."""
-        again = {path: codes for path, codes in self._held().items() if path in taken}
-        if not again:
-            return None
+        # One hold of the lock from giving a device back to taking it again: the watchdog, which
+        # lets go of everything from its own thread, comes wholly before or wholly after, and
+        # after it nothing is taken.
         with self._lock:
+            if not self._grabbed:
+                return None
+            again = {path: codes for path, codes in self._held().items() if path in taken and path in self._fds}
+            if not again:
+                return None
             for path in again:
                 try:
                     self._system.grab(self._fds[path], False)
-                except (OSError, KeyError):
+                except OSError:
                     pass
-        self._release(again)
-        with self._lock:
+            self._release(again)
             for path in again:
                 try:
                     self._system.grab(self._fds[path], True)
-                except (OSError, KeyError) as exc:
+                except OSError as exc:
+                    if exc.errno == EBUSY:
+                        LOGGER.info("%s was taken by another program meanwhile; it is left to it", path)
+                        continue
                     return f"{path}: {exc}"
-        for path, codes in self._held().items():
-            if path in again:
-                LOGGER.warning("%s still has a key or button (%s) as held after its release was written twice; "
-                               "the desktop may repeat it while input is away", path, sorted(codes))
+            for path, codes in self._held().items():
+                if path in again:
+                    LOGGER.warning("%s still has a key or button (%s) as held after its release was written twice; "
+                                   "the desktop may repeat it while input is away", path, sorted(codes))
         return None
 
     def _ungrab_all(self) -> Dict[str, int]:
@@ -696,6 +732,8 @@ class Hooks:
         self._flips = set()
         # A key the keyboard has yet to say again is, from here, pressed for the desktop as well.
         self._ghosts.clear()
+        self._ghost_down.clear()
+        self._dead = None
 
     def _force_home(self, sentence: str) -> None:
         """Let go now and say why; not grabbed again until the predicate has said input is home."""
@@ -746,7 +784,8 @@ class Hooks:
         if not old:
             (self._down.add if down else self._down.discard)(key)
         if self._grabbed:
-            # A Shift held since before the grab counts: the way home asks nothing to be let go first.
+            # A Shift held since before the grab counts where the keyboard said it again. One that
+            # says nothing more of a held key (USB) has it as let go: it is pressed again.
             if down and PANIC_CHORD <= {held for _device, held in self._down | self._ghost_down}:
                 self._force_home(PANIC)
                 return
@@ -755,24 +794,69 @@ class Hooks:
         if old:
             return
         name = self._names_down.get(key) if down else self._names_down.pop(key, None)
+        if name is _AS_TEXT:
+            return  # the peer has the character already, and nothing of this key is held there
         if name is None:
-            name = VK_TO_NAME.get(code)
+            name = self._name(device, code, down)
         if name is None:
-            name = self._character(device, code)
-        if name is None:
+            return
+        if isinstance(name, TextInput):
+            self._names_down[key] = _AS_TEXT
+            self._on_key(name, True, code, None)
             return
         if down:
             self._names_down[key] = name
         self._on_key(name, down, code, keytable.EVDEV_US.get(code))
 
-    def _character(self, device: int, code: int) -> Optional[str]:
+    def _sends_text(self) -> bool:
+        try:
+            return self._types_text is not None and bool(self._types_text())
+        except Exception:
+            LOGGER.exception("Could not tell whether the peer types text")
+            return False
+
+    def _name(self, device: int, code: int, down: bool):
+        """What a key is for the bridge: its name, its character, and going down a TextInput for
+        what only AltGr or a dead key reaches, or None for a key that says nothing (a dead key).
+        A release whose press was not seen is the plain key, and no accent is spent on it."""
+        fixed = VK_TO_NAME.get(code)
+        if fixed is not None:
+            if not down:
+                return fixed
+            if code == KEY_SPACE and self._dead is not None:
+                accent, self._dead = self._dead, None
+                return TextInput(xkb_levels.compose(accent, " "))
+            if code not in MODIFIER_CODES:
+                self._dead = None
+            return fixed
         keymap, group = self._typing(device)
         if keymap is None:
             return None
         mods = self._locks(device)
-        for _device, held in self._down:
-            mods |= HELD_MODS.get(held, 0)
-        return character(code + KEYCODE_OFFSET, mods, group, keymap)
+        held = {held for _device, held in self._down}
+        for one in held:
+            mods |= HELD_MODS.get(one, 0)
+        plain = character(code + KEYCODE_OFFSET, mods, group, keymap)
+        if not down:
+            return plain
+        if mods & CHORD_MASK or not self._sends_text():
+            self._dead = None
+            return plain
+        altgr = KEY_RIGHTALT in held and xkb_levels.has_third_level(keymap, group)
+        keysym = keymap.keysym(code + KEYCODE_OFFSET, mods | (xkb_levels.MOD5_MASK if altgr else 0), group)
+        accent, self._dead = self._dead, None
+        if keysym in xkb_levels.DEAD:
+            if accent is not None:
+                return TextInput(xkb_levels.compose(accent, xkb_levels.DEAD[keysym][1]))
+            self._dead = keysym
+            return None
+        typed = keymap.text(keysym)
+        typed = typed if typed and typed.isprintable() else None
+        if accent is not None and typed is not None:
+            return TextInput(xkb_levels.compose(accent, typed))
+        if altgr and typed is not None and typed != plain:
+            return TextInput(typed)
+        return plain
 
     def _locks(self, device: int) -> int:
         """Caps Lock and Num Lock as the keyboard's LEDs show them, and as the lock keys pressed

@@ -248,6 +248,13 @@ class LinkSender:
         owner = self._owner
         return owner.on if owner is not None else None
 
+    def types_text(self) -> bool:
+        """Whether the machine this PC's input is on types `text` (WIRE.md section 10): a capture
+        that can send a character either as text or as the keys under the fingers asks before
+        each one. False at home."""
+        peer = self.owner
+        return peer is not None and "text" in self.links.caps(peer)
+
     @property
     def route_chain(self) -> tuple:
         """The current route and any onward machine named by a refusal."""

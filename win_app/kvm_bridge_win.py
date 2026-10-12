@@ -659,6 +659,11 @@ class WindowsApplication(QWidget):
         if grab_while is not None:
             grab_while(lambda: self.sender.redirecting)
             self.hooks.on_failure = self._capture_stopped
+        # A capture that reads AltGr and dead keys itself sends what they type as text, to a peer
+        # that types text.
+        text_while = getattr(self.hooks, "text_while", None)
+        if text_while is not None:
+            text_while(self.sender.types_text)
         # Wayland: only the desktop captures input, at barriers on this machine's zones, and it
         # may end a capture itself, which brings input home.
         if hasattr(self.hooks, "barriers_from"):

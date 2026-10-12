@@ -484,13 +484,50 @@ class HeldThroughTest(Rig):
         self.feed(("key", device, KEY_A, True))
         self.assertEqual([key[:2] for key in self.keys], [("a", True)])
 
-    def test_a_held_button_said_again_is_no_click(self):
+    def test_a_mouse_never_says_its_button_again_so_the_next_click_is_a_click(self):
+        # Dragging as input leaves: the click that follows on the peer, however soon, is real.
         self.grab_holding(MOUSE, BTN_LEFT)
         device = self.device(MOUSE)
         self.feed(("button", device, BTN_LEFT, False))
         self.mouse.clear()
         self.feed(("button", device, BTN_LEFT, True), ("button", device, BTN_LEFT, False))
-        self.assertEqual(self.mouse, [])
+        self.assertEqual(len(self.mouse), 2)
+
+    def test_the_watchdog_letting_go_while_a_late_key_is_dealt_with_leaves_nothing_taken(self):
+        # The capture thread stalls between giving a device back and taking it again; the
+        # watchdog lets go of everything meanwhile. Nothing may be taken after it.
+        self.open()
+        real = self.system.grab
+        state = {"pressed": False}
+
+        def grab(fd, on):
+            real(fd, on)
+            if on and not state["pressed"] and self.system.path_of(fd) == KEYBOARD:
+                state["pressed"] = True
+                self.system.down[KEYBOARD] = {KEY_A}
+
+        def release(fd, code, real_release=self.system.release):
+            real_release(fd, code)
+            if state["pressed"]:
+                # As the watchdog would, were the lock free: it must wait, so it is run where the
+                # lock is known to be held, and seen not to get in.
+                self.assertFalse(self.hooks._lock.acquire(blocking=False))
+
+        self.system.grab, self.system.release = grab, release
+        self.away = True
+        self.turn()
+        self.assertTrue(self.hooks.grabbed)
+        self.hooks._let_go_from_outside()
+        self.assertEqual(self.system.grabs, set())
+
+    def test_nothing_is_taken_again_once_everything_was_let_go_from_outside(self):
+        self.open()
+        self.away = True
+        self.turn()
+        self.hooks._let_go_from_outside()
+        self.system.down[KEYBOARD] = {KEY_A}
+        self.assertIsNone(self.hooks._release_again({KEYBOARD}))
+        self.assertEqual(self.system.grabs, set())
 
     def test_a_keyboard_that_does_not_repeat_does_not_cost_the_next_press(self):
         # A USB keyboard says nothing more of a held key, and the kernel drops its release.
@@ -541,6 +578,129 @@ class HeldThroughTest(Rig):
             self.turn()
         self.assertTrue(self.hooks.grabbed)
         self.assertEqual(self.system.log.count(("release", KEYBOARD, CTRL_R)), 2)
+
+
+class FrenchTest(Rig):
+    """An AZERTY keyboard, read through libxkbcommon's own fr layout: what AltGr and the dead keys
+    type goes as text to a peer that types text, and as before to one that does not."""
+
+    ALT_GR, A_GRAVE, E, CIRCUMFLEX, X, RIGHT_PAREN, ENTER, SPACE = 100, 11, 18, 26, 45, 12, 28, 57
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import xkb_x11
+
+            self.keymap = xkb_x11.Keymap.from_names("fr")
+        except (RuntimeError, OSError) as exc:
+            self.skipTest(f"needs libxkbcommon and the fr layout: {exc}")
+        self.text = True
+        self.hooks.text_while(lambda: self.text)
+        self.open()
+        self.board = self.device(KEYBOARD)
+
+    def tap(self, *codes):
+        """Each key down in turn, then up in reverse, as a chord is played."""
+        for code in codes:
+            self.feed(("key", self.board, code, True))
+        for code in reversed(codes):
+            self.feed(("key", self.board, code, False))
+
+    def told(self):
+        """What the bridge was told, text as ("text", ...) and a key as (name, down)."""
+        found = [("text", key[0].text) if isinstance(key[0], capture.TextInput) else key[:2] for key in self.keys]
+        self.keys.clear()
+        return found
+
+    def test_altgr_and_a_key_is_the_character_as_text_and_the_keys_release_says_nothing(self):
+        self.tap(self.ALT_GR, self.A_GRAVE)
+        self.assertEqual(self.told(), [("alt_r", True), ("text", "@"), ("alt_r", False)])
+
+    def test_shift_and_altgr_reach_the_fourth_level(self):
+        self.tap(SHIFT, self.ALT_GR, self.RIGHT_PAREN)
+        self.assertEqual(self.told(), [("shift", True), ("alt_r", True), ("text", "¿"), ("alt_r", False), ("shift", False)])
+
+    def test_text_carries_the_keys_code_for_the_list_of_keys_that_stay_here(self):
+        self.tap(self.ALT_GR, self.A_GRAVE)
+        self.assertEqual([key[2] for key in self.keys if isinstance(key[0], capture.TextInput)], [self.A_GRAVE])
+
+    def test_a_peer_that_does_not_type_text_gets_the_keys_as_before(self):
+        self.text = False
+        self.tap(self.ALT_GR, self.A_GRAVE)
+        self.assertEqual(self.told(), [("alt_r", True), ("à", True), ("à", False), ("alt_r", False)])
+
+    def test_a_shortcut_with_altgr_stays_keys(self):
+        self.tap(CTRL_R, self.ALT_GR, self.A_GRAVE)
+        self.assertEqual(self.told(), [("cmd_r", True), ("alt_r", True), ("à", True), ("à", False), ("alt_r", False), ("cmd_r", False)])
+
+    def test_a_key_with_nothing_more_under_altgr_stays_a_key(self):
+        self.tap(self.ALT_GR, self.SPACE)
+        self.assertEqual(self.told(), [("alt_r", True), ("space", True), ("space", False), ("alt_r", False)])
+
+    def test_a_dead_key_and_a_letter_are_the_accented_letter_as_text(self):
+        self.tap(self.CIRCUMFLEX)
+        self.assertEqual(self.told(), [])
+        self.tap(self.E)
+        self.assertEqual(self.told(), [("text", "ê")])
+
+    def test_shift_between_the_dead_key_and_the_letter_does_not_lose_the_accent(self):
+        self.tap(SHIFT, self.CIRCUMFLEX)   # the diaeresis
+        self.tap(SHIFT, self.E)
+        self.assertEqual(self.told(), [("shift", True), ("shift", False), ("shift", True), ("text", "Ë"), ("shift", False)])
+
+    def test_a_dead_key_before_a_letter_it_does_not_go_on_before_a_space_and_twice(self):
+        for after, text in ((self.X, "^x"), (self.SPACE, "^"), (self.CIRCUMFLEX, "^")):
+            self.tap(self.CIRCUMFLEX)
+            self.tap(after)
+            self.assertEqual(self.told(), [("text", text)])
+
+    def test_a_named_key_after_a_dead_key_drops_the_accent(self):
+        self.tap(self.CIRCUMFLEX)
+        self.tap(self.ENTER)
+        self.tap(self.E)
+        self.assertEqual(self.told(), [("enter", True), ("enter", False), ("e", True), ("e", False)])
+
+    def test_a_dead_key_for_a_peer_that_does_not_type_text_is_dropped_as_before(self):
+        self.text = False
+        self.tap(self.CIRCUMFLEX)
+        self.tap(self.E)
+        self.assertEqual(self.told(), [("e", True), ("e", False)])
+
+    def test_an_accent_waiting_does_not_outlive_a_grab_the_watchdog_ended(self):
+        self.away = True
+        self.turn()
+        self.tap(self.CIRCUMFLEX)
+        self.hooks._let_go_from_outside()
+        self.away = False
+        self.turn()
+        self.away = True
+        self.turn()
+        self.tap(self.E)
+        self.assertEqual(self.told(), [("e", True), ("e", False)])
+
+    def test_an_accent_waiting_does_not_outlive_the_grab(self):
+        self.tap(self.CIRCUMFLEX)
+        self.away = True
+        self.turn()
+        self.away = False
+        self.turn()
+        self.tap(self.E)
+        self.assertEqual(self.told(), [("e", True), ("e", False)])
+
+
+class UsRightAltTest(Rig):
+    def test_right_alt_on_a_layout_with_no_third_level_is_plain_alt(self):
+        try:
+            import xkb_x11
+
+            self.keymap = xkb_x11.Keymap.from_names("us")
+        except (RuntimeError, OSError) as exc:
+            self.skipTest(f"needs libxkbcommon: {exc}")
+        self.hooks.text_while(lambda: True)
+        self.open()
+        device = self.device(KEYBOARD)
+        self.feed(("key", device, 100, True), ("key", device, 18, True))
+        self.assertEqual([key[:2] for key in self.keys], [("alt_r", True), ("e", True)])
 
 
 class WaysHomeTest(Rig):

@@ -453,6 +453,11 @@ They take two permissions, each its own udev rule, so that a machine has only th
   pictures. When a machine sends text and a picture together, the text is what is set.
 - Characters are typed in the layout the compositor says it has. Set `BEAMER_XKB_LAYOUT`, for
   example to `fr` or `fr(bepo)`, if Beamer reads it wrong; the log names the layout it uses.
+- What AltGr reaches (`@ # { } [ ] | \ €` on AZERTY) and what a dead key and a letter make (`ê`,
+  `ë`) are sent as text to a machine that types text, so they arrive whatever its layout; a
+  shortcut is never text. A driven machine types such a character with its own AltGr or dead key,
+  and hands one its layout has no key for at all to `wtype`, if that is installed. A key held down
+  does not repeat a character sent as text.
 - Alt with Print Screen is never pressed for another machine: on these back ends it would be the
   kernel's SysRq.
 - `BEAMER_BACKEND=evdev` or `BEAMER_BACKEND=portal` chooses the back ends outright. Beamer picks

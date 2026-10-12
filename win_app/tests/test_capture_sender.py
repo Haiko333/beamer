@@ -91,6 +91,45 @@ class CaptureSenderTests(unittest.TestCase):
         with mock.patch.object(linux_layout, "sources", lambda said=None: iter([("a test", linux_layout.Names("us"))])):
             self.check_backend("evdev")
 
+    def altgr_at(self, caps):
+        """AltGr+à on an AZERTY keyboard, from the evdev capture through the bridge to the sender."""
+        import desktop_wlroots
+        import linux_layout
+        import xkb_x11
+
+        try:
+            keymap = xkb_x11.Keymap.from_names("fr")
+        except (RuntimeError, OSError) as exc:
+            self.skipTest(f"needs libxkbcommon and the fr layout: {exc}")
+        self.addCleanup(keymap.close)
+        desktop_wlroots.use(None)
+        self.addCleanup(desktop_wlroots.use, None)
+        capture = platform_parts.load("linux", {"XDG_SESSION_TYPE": "wayland", "BEAMER_BACKEND": "evdev"}).capture
+        rig = Rig()
+        rig.links.caps_of[B] = caps
+        assert rig.sender.set_redirecting(True)
+        application = shell(rig, capture)
+        with mock.patch.object(kvm_bridge_win, "capture_win", capture), mock.patch.object(sender, "OWN_PLATFORM", "linux"), \
+                mock.patch.object(linux_layout, "sources", lambda said=None: iter([("a test", linux_layout.Names("fr"))])):
+            hooks = capture.Hooks(lambda *args: kvm_bridge_win.WindowsApplication._on_hook_key(application, *args),
+                                  lambda *_: False, lambda *_: None)
+            hooks._keymap_factory = lambda said=None: (keymap, None, "a test")
+            # As the bridge wires it.
+            hooks.text_while(rig.sender.types_text)
+            for code, down in ((100, True), (11, True), (11, False), (100, False)):
+                hooks._key(1, code, down)
+        return [(message["type"], message["data"].get("key", message["data"].get("text")))
+                for message in rig.sent(B) if message["type"] in protocol.INPUT_TYPES]
+
+    def test_evdev_altgr_character_goes_as_text_with_altgr_let_go_round_it(self):
+        self.assertEqual(self.altgr_at(frozenset({"text"})), [
+            (protocol.MSG_KEYDOWN, "alt_r"), (protocol.MSG_KEYUP, "alt_r"), (protocol.MSG_TEXT, "@"),
+            (protocol.MSG_KEYDOWN, "alt_r"), (protocol.MSG_KEYUP, "alt_r")])
+
+    def test_evdev_altgr_for_a_peer_without_text_is_the_two_keys_as_before(self):
+        self.assertEqual(self.altgr_at(frozenset()), [
+            (protocol.MSG_KEYDOWN, "alt_r"), (protocol.MSG_KEYDOWN, "à"), (protocol.MSG_KEYUP, "à"), (protocol.MSG_KEYUP, "alt_r")])
+
     def test_windows_dead_key_and_composed_text_still_reach_sender(self):
         rig = Rig()
         rig.links.caps_of[B] = frozenset({"text"})
