@@ -483,7 +483,7 @@ desktop, for the Linux machine itself:
 
 | Desktop | Back ends | On real hardware | Notes |
 |---|---|---|---|
-| Hyprland | evdev | **Tested**: Arch Linux, a laptop with its touchpad and a French AZERTY keyboard | Edges and shortcut |
+| Hyprland | evdev | **Tested**: Arch Linux, a laptop with its touchpad and a French AZERTY keyboard | Edges and shortcut. A key held as the keyboard is taken is let go for the desktop and stops repeating there (tried on the laptop's own keyboard with `tools/grab_probe.py`) |
 | sway and other wlroots compositors | evdev | Not tested | Shortcut only, no edge |
 | GNOME on Wayland | portal | Not tested in this fork; upstream tested 1.5.2 on Fedora 44 | AltGr and dead keys are not typed beyond what 1.5.2 types |
 | KDE Plasma on Wayland | portal | Not tested, here or upstream | As GNOME |
@@ -499,7 +499,7 @@ By the machine at the other end, with Hyprland on this one:
 | Linux and macOS | Not tested | |
 
 Not tried on real hardware on any desktop: more than one monitor, a scaled monitor, an external
-mouse or USB keyboard, a key held as input leaves, `wtype`, and a layout other than French.
+mouse or USB keyboard (a key held as input leaves included, on one), `wtype`, and a layout other than French.
 
 Older Ubuntu and Debian releases lack the InputCapture portal, so they cannot send input out under
 Wayland; use an X11 session there. Linux does not offer gestures. KDE Plasma awaits hardware
